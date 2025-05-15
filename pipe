@@ -1,0 +1,4155 @@
+import logging
+import json
+import math
+import time
+import asyncio
+import re
+import os
+import random
+import numpy as np
+import aiohttp
+import concurrent.futures
+import tempfile
+import gzip
+from datetime import datetime
+from typing import Dict, List, Callable, Awaitable, Optional, Any, Union, Set, Tuple
+from pydantic import BaseModel, Field
+from sklearn.metrics.pairwise import cosine_similarity
+from open_webui.constants import TASKS
+from open_webui.main import generate_chat_completions
+from open_webui.models.users import User
+
+name = "Source Finder"
+
+
+def setup_logger():
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        logger.setLevel(logging.DEBUG)
+        handler = logging.StreamHandler()
+        handler.set_name(name)
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.propagate = False
+    return logger
+
+
+logger = setup_logger()
+
+
+class EmbeddingCache:
+    """Cache for embeddings to avoid redundant API calls"""
+
+    def __init__(self, max_size=10000000):
+        self.cache = {}
+        self.max_size = max_size
+        self.hit_count = 0
+        self.miss_count = 0
+        self.url_token_counts = {}  # Track token counts for URLs
+
+    def get(self, text_key):
+        """Get embedding from cache using text as key"""
+        # Use a hash of the text as the key to limit memory usage
+        key = hash(text_key[:2000])
+        result = self.cache.get(key)
+        if result is not None:
+            self.hit_count += 1
+        return result
+
+    def set(self, text_key, embedding):
+        """Store embedding in cache"""
+        # Use a hash of the text as the key to limit memory usage
+        key = hash(text_key[:2000])
+        self.cache[key] = embedding
+        self.miss_count += 1
+
+        # Simple LRU-like pruning if cache gets too large
+        if len(self.cache) > self.max_size:
+            # Remove a random key as a simple eviction strategy
+            self.cache.pop(next(iter(self.cache)))
+
+    def stats(self):
+        """Return cache statistics"""
+        total = self.hit_count + self.miss_count
+        hit_rate = self.hit_count / total if total > 0 else 0
+        return {
+            "size": len(self.cache),
+            "hits": self.hit_count,
+            "misses": self.miss_count,
+            "hit_rate": hit_rate,
+        }
+
+
+class SourceFinderStateManager:
+    """Manages state per conversation to ensure proper isolation"""
+
+    def __init__(self):
+        self.conversation_states = {}
+
+    def get_state(self, conversation_id):
+        """Get state for a specific conversation, creating if needed"""
+        if conversation_id not in self.conversation_states:
+            self.conversation_states[conversation_id] = {
+                "search_complete": False,
+                "waiting_for_source_feedback": False,
+                "source_feedback_data": None,
+                "user_preferences": {"pdv": None, "strength": 0.0, "impact": 0.0},
+                "url_selected_count": {},
+                "url_considered_count": {},
+                "url_token_counts": {},
+                "source_table": {},
+                "saved_sources": [],
+                "rejected_sources": [],
+                "search_history": [],
+                "sources_list": [],
+                "cycle_count": 0,
+            }
+        return self.conversation_states[conversation_id]
+
+    def update_state(self, conversation_id, key, value):
+        """Update a specific state value for a conversation"""
+        state = self.get_state(conversation_id)
+        state[key] = value
+
+    def reset_state(self, conversation_id):
+        """Reset the state for a specific conversation"""
+        if conversation_id in self.conversation_states:
+            del self.conversation_states[conversation_id]
+
+
+class Pipe:
+    __current_event_emitter__: Callable[[dict], Awaitable[None]]
+    __current_event_call__: Callable[[dict], Awaitable[Any]]
+    __user__: User
+    __model__: str
+    __request__: Any
+
+    class Valves(BaseModel):
+        ENABLED: bool = Field(
+            default=True,
+            description="Enable Source Finder pipe",
+        )
+        RESEARCH_MODEL: str = Field(
+            default="gemma3:12b",
+            description="Model for generating search queries and evaluating sources",
+        )
+        EMBEDDING_MODEL: str = Field(
+            default="granite-embedding:30m",
+            description="Model for semantic comparison of content",
+        )
+        QUALITY_FILTER_MODEL: str = Field(
+            default="gemma3:4b",
+            description="Model used for filtering irrelevant search results",
+        )
+        QUALITY_FILTER_ENABLED: bool = Field(
+            default=True,
+            description="Whether to use quality filtering for search results",
+        )
+        QUALITY_SIMILARITY_THRESHOLD: float = Field(
+            default=0.60,
+            description="Similarity threshold below which quality filtering is applied",
+            ge=0.0,
+            le=1.0,
+        )
+        SEARCH_RESULTS_PER_QUERY: int = Field(
+            default=3,
+            description="Base number of search results to use per query",
+            ge=1,
+            le=10,
+        )
+        EXTRA_RESULTS_PER_QUERY: int = Field(
+            default=3,
+            description="Maximum extra results to add when repeat URLs are detected",
+            ge=0,
+            le=5,
+        )
+        SUCCESSFUL_RESULTS_PER_QUERY: int = Field(
+            default=1,
+            description="Number of successful results to keep per query",
+            ge=1,
+            le=5,
+        )
+        TEMPERATURE: float = Field(
+            default=0.7, description="Temperature for generation", ge=0.0, le=2.0
+        )
+        OLLAMA_URL: str = Field(
+            default="http://localhost:11434", description="URL for Ollama API"
+        )
+        SEARCH_URL: str = Field(
+            default="http://192.168.1.1:8888/search?q=",
+            description="URL for web search API",
+        )
+        MAX_FAILED_RESULTS: int = Field(
+            default=6,
+            description="Maximum number of failed results before abandoning a query",
+            ge=1,
+            le=10,
+        )
+        EXTRACT_CONTENT_ONLY: bool = Field(
+            default=True,
+            description="Extract only text content from HTML, removing scripts, styles, etc.",
+        )
+        PDF_MAX_PAGES: int = Field(
+            default=25,
+            description="Maximum number of pages to extract from a PDF",
+            ge=5,
+            le=500,
+        )
+        HANDLE_PDFS: bool = Field(
+            default=True,
+            description="Enable processing of PDF files",
+        )
+        RELEVANCY_SNIPPET_LENGTH: int = Field(
+            default=2000,
+            description="Number of characters to use when comparing extra results for relevance",
+            ge=100,
+            le=5000,
+        )
+        DOMAIN_PRIORITY: str = Field(
+            default="",
+            description="Comma or space-separated list of domain keywords to prioritize (e.g., '.gov, .edu, epa'). Leave empty to disable domain prioritization.",
+        )
+        CONTENT_PRIORITY: str = Field(
+            default="",
+            description="Comma or space-separated list of content keywords to prioritize (e.g., 'pfas, spatial, groundwater'). Leave empty to disable content prioritization.",
+        )
+        DOMAIN_MULTIPLIER: float = Field(
+            default=1.3,
+            description="Multiplier for results from priority domains (1.0 = no change, 2.0 = double score)",
+            ge=1.0,
+            le=3.0,
+        )
+        KEYWORD_MULTIPLIER_PER_MATCH: float = Field(
+            default=1.1,
+            description="Multiplier applied per matched content keyword (1.1 = 10% increase per keyword)",
+            ge=1.0,
+            le=1.5,
+        )
+        MAX_KEYWORD_MULTIPLIER: float = Field(
+            default=2.0,
+            description="Maximum total multiplier from content keywords",
+            ge=1.0,
+            le=3.0,
+        )
+        PREFERENCE_STRENGTH: float = Field(
+            default=0.7,
+            description="Strength of user preferences for directing source search (0.0-1.0)",
+            ge=0.0,
+            le=1.0,
+        )
+        MAX_SOURCE_TOKENS: int = Field(
+            default=3000,
+            description="Maximum tokens per source to display",
+            ge=1000,
+            le=8000,
+        )
+        THREAD_WORKERS: int = Field(
+            default=2,
+            description="Number of worker threads for parallel processing",
+            ge=1,
+            le=2,
+        )
+        PRELOAD_VOCABULARY: bool = Field(
+            default=True,
+            description="Whether to preload vocabulary embeddings for semantic analysis",
+        )
+        VOCABULARY_SIZE: int = Field(
+            default=10000,
+            description="Number of vocabulary words to use for semantic analysis",
+            ge=1000,
+            le=30000,
+        )
+
+    def __init__(self):
+        self.type = "manifold"
+        self.valves = self.Valves()
+
+        # Use state manager to isolate conversation states
+        self.state_manager = SourceFinderStateManager()
+        self.conversation_id = None  # Will be set during pipe method
+
+        # Shared resources (not conversation-specific)
+        self.embedding_cache = EmbeddingCache(max_size=10000000)
+        self.is_pdf_content = False
+        self.search_date = None
+
+        self.search_date = datetime.now().strftime("%Y-%m-%d")
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.valves.THREAD_WORKERS
+        )
+        self.vocabulary_cache = None
+        self.vocabulary_embeddings = None
+
+    def get_state(self):
+        """Get the current conversation state"""
+        if not self.conversation_id:
+            # Generate a temporary ID if we don't have one yet
+            self.conversation_id = f"temp_{hash(str(self.__user__.id))}"
+        return self.state_manager.get_state(self.conversation_id)
+
+    def update_state(self, key, value):
+        """Update a specific state value"""
+        self.state_manager.update_state(self.conversation_id, key, value)
+
+    def reset_state(self):
+        """Reset the state for the current conversation"""
+        if self.conversation_id:
+            self.state_manager.reset_state(self.conversation_id)
+            self.is_pdf_content = False
+            logger.info(f"Full state reset for conversation: {self.conversation_id}")
+
+    def pipes(self) -> list[dict[str, str]]:
+        return [{"id": f"{name}-pipe", "name": f"{name} Pipe"}]
+
+    async def count_tokens(self, text: str) -> int:
+        """Count tokens in text using Ollama API"""
+        if not text:
+            return 0
+
+        try:
+            # Use Ollama's tokenize endpoint with the specified model
+            connector = aiohttp.TCPConnector(force_close=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                payload = {
+                    "model": self.valves.RESEARCH_MODEL,
+                    "prompt": text,  # Do not limit length for token counting
+                }
+
+                async with session.post(
+                    f"{self.valves.OLLAMA_URL}/api/tokenize", json=payload, timeout=10
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        tokens = result.get("tokens", [])
+                        # If we got only a partial count due to truncation, estimate full count
+                        if len(text) > 2000:
+                            ratio = len(text) / 2000
+                            return int(len(tokens) * ratio)
+                        return len(tokens)
+        except Exception as e:
+            logger.error(f"Error counting tokens with Ollama API: {e}")
+
+        # Fallback to simple estimation if API call fails
+        words = text.split()
+        return int(len(words) * 1.3)  # Approximate token count using words
+
+    async def get_embedding(self, text: str) -> Optional[List[float]]:
+        """Get embedding for a text string using the configured embedding model with caching"""
+        if not text or not text.strip():
+            return None
+
+        text = text[:2000]
+        text = text.replace(":", " - ")
+
+        # Check cache first
+        cached_embedding = self.embedding_cache.get(text)
+        if cached_embedding is not None:
+            return cached_embedding
+
+        # If not in cache, get from API
+        try:
+            connector = aiohttp.TCPConnector(force_close=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                payload = {
+                    "model": self.valves.EMBEDDING_MODEL,
+                    "input": text,
+                }
+
+                async with session.post(
+                    f"{self.valves.OLLAMA_URL}/api/embed", json=payload, timeout=30
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        # Handle both old and new API response formats
+                        if "embedding" in result:
+                            embedding = result.get("embedding", [])
+                            if embedding:
+                                # Cache the result
+                                self.embedding_cache.set(text, embedding)
+                                return embedding
+                        elif "embeddings" in result and result["embeddings"]:
+                            # New format with batch response (we only sent one text, so take first)
+                            embedding = result["embeddings"][0]
+                            if embedding:
+                                # Cache the result
+                                self.embedding_cache.set(text, embedding)
+                                return embedding
+                    else:
+                        logger.warning(
+                            f"Embedding request failed with status {response.status}"
+                        )
+
+            return None
+        except Exception as e:
+            logger.error(f"Error getting embedding: {e}")
+            return None
+
+    async def clean_text_formatting(self, content: str) -> str:
+        """Clean text formatting by merging short lines and handling repeated character patterns"""
+        # Handle repeated character patterns first
+        # Split into lines to process each line individually
+        lines = content.split("\n")
+        cleaned_lines = []
+
+        for line in lines:
+            # Check for repeated characters (5+ identical characters in a row)
+            repeated_char_pattern = re.compile(
+                r"((.)\2{4,})"
+            )  # Same character 5+ times
+            matches = list(repeated_char_pattern.finditer(line))
+
+            if matches:
+                # Process each match in reverse order to avoid index shifts
+                for match in reversed(matches):
+                    char_sequence = match.group(1)
+                    char = match.group(2)
+                    if len(char_sequence) >= 5:
+                        # Keep first 2 and last 2 instances, replace middle with (...)
+                        replacement = char * 2 + "(...)" + char * 2
+                        start, end = match.span()
+                        line = line[:start] + replacement + line[end:]
+
+            # Check for repeated character patterns (like abc abc abc abc)
+            # Look for patterns of 2-3 chars that repeat at least 3 times
+            for pattern_length in range(2, 4):  # Check for 2-3 character patterns
+                i = 0
+                while (
+                    i <= len(line) - pattern_length * 5
+                ):  # Need at least 5 repetitions
+                    pattern = line[i : i + pattern_length]
+
+                    # Check if this is a repeating pattern
+                    repetition_count = 0
+                    for j in range(i, len(line) - pattern_length + 1, pattern_length):
+                        if line[j : j + pattern_length] == pattern:
+                            repetition_count += 1
+                        else:
+                            break
+
+                    # If we found a repeated pattern
+                    if repetition_count >= 5:
+                        # Keep first 2 and last 2 repetitions, replace middle with (...)
+                        replacement = pattern * 2 + "(...)" + pattern * 2
+                        total_length = pattern_length * repetition_count
+                        line = line[:i] + replacement + line[i + total_length :]
+
+                    i += 1
+
+            # Check for repeated patterns with ellipsis that are created by earlier processing
+            ellipsis_pattern = re.compile(r"(\S\S\(\.\.\.\)\S\S\s+)(\1){2,}")
+            ellipsis_matches = list(ellipsis_pattern.finditer(line))
+
+            if ellipsis_matches:
+                # Process each match in reverse order to avoid index shifts
+                for match in reversed(ellipsis_matches):
+                    # Replace multiple repetitions with just one instance
+                    single_instance = match.group(1)
+                    start, end = match.span()
+                    line = line[:start] + single_instance + line[end:]
+
+            cleaned_lines.append(line)
+
+        # Now handle short lines processing with semantic awareness
+        lines = cleaned_lines
+        merged_lines = []
+        short_line_group = []
+
+        # Define better mixed case pattern (lowercase followed by uppercase in the same word)
+        # This will match patterns like: "PsychologyFor", "MediaPsychology", etc.
+        mixed_case_pattern = re.compile(r"[a-z][A-Z]")
+
+        i = 0
+        while i < len(lines):
+            current_line = lines[i].strip()
+            word_count = len(current_line.split())
+
+            # Check if this is a short line (5 words or fewer)
+            if word_count <= 5 and current_line:
+                # Check if it's part of a numbered list
+                is_numbered_item = False
+
+                # Match various numbering patterns:
+                # - "1. Item"
+                # - "1) Item"
+                # - "1: Item"
+                # - "A. Item"
+                # - "A) Item"
+                # - "A: Item"
+                # - "Item 1."
+                # - "Item 1)"
+                # - "Item 1:"
+                number_patterns = [
+                    r"^\d+[\.\)\:]",
+                    r"^[A-Za-z][\.\)\:]",
+                    r".*\d+[\.\)\:]$",
+                ]
+
+                # Check if line matches any numbered pattern
+                for pattern in number_patterns:
+                    if re.search(pattern, current_line):
+                        is_numbered_item = True
+                        break
+
+                # Check if this is part of a sequence of numbered items
+                if is_numbered_item and short_line_group:
+                    # Look for sequential numbering
+                    prev_number = None
+                    curr_number = None
+
+                    # Try to extract numbers from current and previous line
+                    prev_line = short_line_group[-1]
+                    prev_match = re.search(r"(\d+)[\.\)\:]", prev_line)
+                    curr_match = re.search(r"(\d+)[\.\)\:]", current_line)
+
+                    if prev_match and curr_match:
+                        try:
+                            prev_number = int(prev_match.group(1))
+                            curr_number = int(curr_match.group(1))
+
+                            # Check if sequential
+                            if curr_number == prev_number + 1:
+                                is_numbered_item = True
+                            else:
+                                is_numbered_item = False
+                        except ValueError:
+                            pass
+
+                # If it's a numbered item in a sequence, treat as normal text
+                if is_numbered_item:
+                    # Add it as separate line
+                    if short_line_group:
+                        # Flush any existing short lines
+                        for j, short_line in enumerate(short_line_group):
+                            merged_lines.append(short_line)
+                        short_line_group = []
+
+                    # Add this numbered item
+                    merged_lines.append(current_line)
+                else:
+                    # Add to current group of short lines
+                    short_line_group.append(current_line)
+            else:
+                # Process any existing short line group before adding this line
+                if short_line_group:
+                    # Check if we have 5 or more short lines in a sequence
+                    if len(short_line_group) >= 5:
+                        # Count mixed case occurrences in the group
+                        mixed_case_count = 0
+                        total_lc_to_uc = 0
+
+                        for line in short_line_group:
+                            # Count individual lowercase-to-uppercase transitions
+                            for j in range(1, len(line)):
+                                if (
+                                    j > 0
+                                    and line[j - 1].islower()
+                                    and line[j].isupper()
+                                ):
+                                    total_lc_to_uc += 1
+
+                            # Also check if the line itself has the mixed case pattern
+                            if mixed_case_pattern.search(line):
+                                mixed_case_count += 1
+
+                        # If many lines have mixed case patterns or there are many transitions,
+                        # they're likely navigation/menu items
+                        has_mixed_case = (
+                            mixed_case_count >= len(short_line_group) * 0.3
+                        ) or (total_lc_to_uc >= 3)
+
+                        # Keep first two and last two, replace middle with note
+                        if merged_lines:
+                            # Combine first two with previous line if possible
+                            for j in range(min(2, len(short_line_group))):
+                                merged_lines[-1] += f". {short_line_group[j]}"
+
+                            # Add note about removed headers
+                            if has_mixed_case:
+                                merged_lines.append("(Navigation menu removed)")
+                            else:
+                                merged_lines.append("(Headers removed)")
+
+                            # Add last two as separate lines
+                            last_idx = len(short_line_group) - 2
+                            if (
+                                last_idx >= 2
+                            ):  # Ensure we have lines left after removing middle
+                                merged_lines.append(short_line_group[last_idx])
+                                merged_lines.append(short_line_group[last_idx + 1])
+                        else:
+                            # If no previous line, handle differently
+                            for j in range(min(2, len(short_line_group))):
+                                merged_lines.append(short_line_group[j])
+
+                            # Add note about removed headers or menu
+                            if has_mixed_case:
+                                merged_lines.append("(Navigation menu removed)")
+                            else:
+                                merged_lines.append("(Headers removed)")
+
+                            last_idx = len(short_line_group) - 2
+                            if last_idx >= 2:
+                                merged_lines.append(short_line_group[last_idx])
+                                merged_lines.append(short_line_group[last_idx + 1])
+                    else:
+                        # For small groups, merge with previous line if possible
+                        for j, short_line in enumerate(short_line_group):
+                            if j == 0 and merged_lines:
+                                # First short line gets merged with previous
+                                merged_lines[-1] += f". {short_line}"
+                            else:
+                                # Subsequent lines added separately
+                                merged_lines.append(short_line)
+
+                    # Reset short line group
+                    short_line_group = []
+
+                # Add current non-short line
+                if current_line:
+                    merged_lines.append(current_line)
+
+            i += 1
+
+        # Handle any remaining short line group
+        if short_line_group:
+            if len(short_line_group) >= 5:
+                # Count mixed case occurrences in the group
+                mixed_case_count = 0
+                total_lc_to_uc = 0
+
+                for line in short_line_group:
+                    # Count individual lowercase-to-uppercase transitions
+                    for j in range(1, len(line)):
+                        if j > 0 and line[j - 1].islower() and line[j].isupper():
+                            total_lc_to_uc += 1
+
+                    # Also check if the line itself has the mixed case pattern
+                    if mixed_case_pattern.search(line):
+                        mixed_case_count += 1
+
+                # If many lines have mixed case patterns or there are many transitions,
+                # they're likely navigation/menu items
+                has_mixed_case = (mixed_case_count >= len(short_line_group) * 0.3) or (
+                    total_lc_to_uc >= 3
+                )
+
+                # Keep first two and last two, replace middle with note
+                if merged_lines:
+                    # Combine first two with previous line if possible
+                    for j in range(min(2, len(short_line_group))):
+                        merged_lines[-1] += f". {short_line_group[j]}"
+
+                    # Add note about removed headers
+                    if has_mixed_case:
+                        merged_lines.append("(Navigation menu removed)")
+                    else:
+                        merged_lines.append("(Headers removed)")
+
+                    # Add last two as separate lines
+                    last_idx = len(short_line_group) - 2
+                    if last_idx >= 2:
+                        merged_lines.append(short_line_group[last_idx])
+                        merged_lines.append(short_line_group[last_idx + 1])
+                else:
+                    # If no previous line, handle differently
+                    for j in range(min(2, len(short_line_group))):
+                        merged_lines.append(short_line_group[j])
+
+                    # Add appropriate removal note
+                    if has_mixed_case:
+                        merged_lines.append("(Navigation menu removed)")
+                    else:
+                        merged_lines.append("(Headers removed)")
+
+                    last_idx = len(short_line_group) - 2
+                    if last_idx >= 2:
+                        merged_lines.append(short_line_group[last_idx])
+                        merged_lines.append(short_line_group[last_idx + 1])
+            else:
+                # For small groups, merge with previous line if possible
+                for j, short_line in enumerate(short_line_group):
+                    if j == 0 and merged_lines:
+                        # First short line gets merged with previous
+                        merged_lines[-1] += f". {short_line}"
+                    else:
+                        # Subsequent lines added separately
+                        merged_lines.append(short_line)
+
+        return "\n".join(merged_lines)
+
+    async def extract_text_from_html(self, html_content: str) -> str:
+        """Extract meaningful text content from HTML with proper character handling"""
+        try:
+            # Try BeautifulSoup if available
+            try:
+                from bs4 import BeautifulSoup
+                import html
+                import re  # Explicitly import re here for the closure
+
+                # Create a task for BS4 extraction
+                def extract_with_bs4():
+                    # First unescape HTML entities properly
+                    unescaped_content = html.unescape(html_content)
+
+                    soup = BeautifulSoup(unescaped_content, "html.parser")
+
+                    # Remove common navigation elements by tag
+                    for element in soup(
+                        [
+                            "script",
+                            "style",
+                            "head",
+                            "iframe",
+                            "noscript",
+                            "nav",
+                            "header",
+                            "footer",
+                            "aside",
+                            "form",
+                        ]
+                    ):
+                        element.decompose()
+
+                    # Remove common menu and navigation classes - expanded list
+                    nav_patterns = [
+                        "menu",
+                        "nav",
+                        "header",
+                        "footer",
+                        "sidebar",
+                        "dropdown",
+                        "ibar",
+                        "navigation",
+                        "navbar",
+                        "topbar",
+                        "tab",
+                        "toolbar",
+                        "section",
+                        "submenu",
+                        "subnav",
+                        "panel",
+                        "drawer",
+                        "accordion",
+                        "toc",
+                        "login",
+                        "signin",
+                        "auth",
+                        "user-login",
+                        "authType",
+                    ]
+
+                    # Case-insensitive class matching with partial matches
+                    for element in soup.find_all(
+                        class_=lambda c: c
+                        and any(x.lower() in c.lower() for x in nav_patterns)
+                    ):
+                        element.decompose()
+
+                    # Remove all unordered lists that contain mostly links (likely menus)
+                    for ul in soup.find_all("ul"):
+                        links = ul.find_all("a")
+                        list_items = ul.find_all("li")
+
+                        # If it contains links and either:
+                        # 1. Most children are links, or
+                        # 2. There are many list items (10+)
+                        # Then it's likely a navigation menu
+                        if links and (
+                            (list_items and len(links) / len(list_items) > 0.7)
+                            or len(links) >= 10
+                            or len(list_items) >= 10
+                        ):
+                            ul.decompose()
+
+                    # Extract text with proper whitespace handling
+                    text = soup.get_text(" ", strip=True)
+
+                    # Normalize whitespace while preserving intended breaks
+                    # Replace multiple spaces with a single space
+                    text = re.sub(r" {2,}", " ", text)
+
+                    # Fix common issues with periods and spaces
+                    text = re.sub(
+                        r"\.([A-Z])", ". \\1", text
+                    )  # Fix "years.Today's" -> "years. Today's"
+
+                    # Process text line by line to better handle paragraph breaks
+                    lines = text.split("\n")
+                    processed_lines = []
+
+                    for line in lines:
+                        # Remove excess whitespace within each line
+                        line = re.sub(r"\s+", " ", line).strip()
+                        if line:
+                            processed_lines.append(line)
+
+                    # Join with proper paragraph breaks
+                    return "\n\n".join(processed_lines)
+
+                # Run in executor to avoid blocking
+                loop = asyncio.get_event_loop()
+                bs4_extraction_task = loop.run_in_executor(None, extract_with_bs4)
+                bs4_result = await asyncio.wait_for(bs4_extraction_task, timeout=5.0)
+
+                # If BS4 extraction gave substantial content, use it
+                if bs4_result and len(bs4_result) > len(html_content) * 0.1:
+                    return bs4_result
+
+                # Otherwise fall back to the regex version
+                # Quick regex extraction first
+                import re
+                import html
+
+                # First unescape HTML entities properly
+                unescaped_content = html.unescape(html_content)
+
+                # Remove script and style tags
+                content = re.sub(
+                    r"<script[^>]*>.*?</script>",
+                    " ",
+                    unescaped_content,
+                    flags=re.DOTALL,
+                )
+                content = re.sub(
+                    r"<style[^>]*>.*?</style>", " ", content, flags=re.DOTALL
+                )
+                content = re.sub(
+                    r"<head[^>]*>.*?</head>", " ", content, flags=re.DOTALL
+                )
+                content = re.sub(r"<nav[^>]*>.*?</nav>", " ", content, flags=re.DOTALL)
+                content = re.sub(
+                    r"<header[^>]*>.*?</header>", " ", content, flags=re.DOTALL
+                )
+                content = re.sub(
+                    r"<footer[^>]*>.*?</footer>", " ", content, flags=re.DOTALL
+                )
+
+                # Remove HTML tags
+                content = re.sub(r"<[^>]*>", " ", content)
+
+                # Fix common issues with periods and spaces
+                content = re.sub(
+                    r"\.([A-Z])", ". \\1", content
+                )  # Fix "years.Today's" -> "years. Today's"
+
+                # Cleanup whitespace
+                content = re.sub(r"\s+", " ", content).strip()
+
+                return content
+
+            except (ImportError, asyncio.TimeoutError, Exception) as e:
+                logger.warning(
+                    f"BeautifulSoup extraction failed: {e}, using regex fallback"
+                )
+                # Use regex version if BS4 fails
+                import re
+                import html
+
+                # First unescape HTML entities properly
+                unescaped_content = (
+                    html.unescape(html_content)
+                    if isinstance(html_content, str)
+                    else html_content
+                )
+
+                # Remove script and style tags
+                content = re.sub(
+                    r"<script[^>]*>.*?</script>",
+                    " ",
+                    unescaped_content,
+                    flags=re.DOTALL,
+                )
+                content = re.sub(
+                    r"<style[^>]*>.*?</style>", " ", content, flags=re.DOTALL
+                )
+                content = re.sub(
+                    r"<head[^>]*>.*?</head>", " ", content, flags=re.DOTALL
+                )
+                content = re.sub(r"<nav[^>]*>.*?</nav>", " ", content, flags=re.DOTALL)
+                content = re.sub(
+                    r"<header[^>]*>.*?</header>", " ", content, flags=re.DOTALL
+                )
+                content = re.sub(
+                    r"<footer[^>]*>.*?</footer>", " ", content, flags=re.DOTALL
+                )
+
+                # Remove HTML tags
+                content = re.sub(r"<[^>]*>", " ", content)
+
+                # Fix common issues with periods and spaces
+                content = re.sub(
+                    r"\.([A-Z])", ". \\1", content
+                )  # Fix "years.Today's" -> "years. Today's"
+
+                # Cleanup whitespace
+                content = re.sub(r"\s+", " ", content).strip()
+
+                return content
+
+        except Exception as e:
+            logger.error(f"Error extracting text from HTML: {e}")
+            # Simple fallback - remove all HTML tags and unescape HTML entities
+            try:
+                import re
+                import html
+
+                # Unescape HTML entities
+                if isinstance(html_content, str):
+                    unescaped = html.unescape(html_content)
+                else:
+                    unescaped = html_content
+
+                # Remove HTML tags
+                text = re.sub(r"<[^>]*>", " ", unescaped)
+
+                # Normalize whitespace
+                text = re.sub(r"\s+", " ", text).strip()
+
+                return text
+            except:
+                return html_content
+
+    async def fetch_content(self, url: str) -> str:
+        """Fetch content from a URL with anti-blocking measures and domain-specific rate limiting"""
+        try:
+            state = self.get_state()
+            url_considered_count = state.get("url_considered_count", {})
+            url_results_cache = state.get("url_results_cache", {})
+            source_table = state.get("source_table", {})
+            domain_session_map = state.get("domain_session_map", {})
+
+            # Add to considered URLs counter
+            url_considered_count[url] = url_considered_count.get(url, 0) + 1
+            self.update_state("url_considered_count", url_considered_count)
+
+            # Check if URL is in cache and use that if available
+            if url in url_results_cache:
+                logger.info(f"Using cached content for URL: {url}")
+                return url_results_cache[url]
+
+            logger.debug(f"Using direct fetch for URL: {url}")
+
+            # Extract domain for session management and tracking
+            from urllib.parse import urlparse
+
+            parsed_url = urlparse(url)
+            domain = parsed_url.netloc
+
+            # Domain-specific rate limiting
+            # Check if we've recently accessed this domain
+            if domain in domain_session_map:
+                domain_info = domain_session_map[domain]
+                last_access_time = domain_info.get("last_visit", 0)
+                current_time = time.time()
+                time_since_last_access = current_time - last_access_time
+
+                # If we accessed this domain recently, delay to avoid rate limiting
+                # Only delay if less than 2-3 seconds have passed since last access
+                if time_since_last_access < 3.0:
+                    # Add randomness to the delay (between 2-3 seconds total between requests)
+                    base_delay = 2.0
+                    jitter = random.uniform(0.1, 1.0)
+                    delay_time = max(0, base_delay - time_since_last_access + jitter)
+
+                    if delay_time > 0.1:  # Only log/delay if significant
+                        logger.info(
+                            f"Rate limiting for domain {domain}: Delaying for {delay_time:.2f} seconds"
+                        )
+                        await asyncio.sleep(delay_time)
+
+            # Import fake-useragent for better user agent rotation
+            try:
+                from fake_useragent import UserAgent
+
+                ua = UserAgent()
+                random_user_agent = ua.random
+            except ImportError:
+                # Fallback if fake-useragent is not installed
+                user_agents = [
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/123.0.0.0 Safari/537.36",
+                ]
+                random_user_agent = random.choice(user_agents)
+
+            # Create comprehensive browser fingerprint headers
+            headers = {
+                "User-Agent": random_user_agent,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-User": "?1",
+                "Cache-Control": "max-age=0",
+                "sec-ch-ua": '"Chromium";v="116", "Google Chrome";v="116", "Not=A?Brand";v="99"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+            }
+
+            # Add EZproxy-like headers
+            university_ips = {
+                "Harvard": "128.103.192." + str(random.randint(1, 254)),
+                "Princeton": "128.112.203." + str(random.randint(1, 254)),
+                "MIT": "18.7."
+                + str(random.randint(1, 254))
+                + "."
+                + str(random.randint(1, 254)),
+                "Stanford": "171.64."
+                + str(random.randint(1, 254))
+                + "."
+                + str(random.randint(1, 254)),
+            }
+
+            chosen_university = random.choice(list(university_ips.keys()))
+            headers["X-Forwarded-For"] = university_ips[chosen_university]
+            headers["X-Requested-With"] = "XMLHttpRequest"
+
+            # Add institutional cookies
+            if domain not in domain_session_map:
+                domain_session_map[domain] = {
+                    "cookies": {},
+                    "last_visit": 0,
+                    "visit_count": 0,
+                }
+
+            domain_session_map[domain]["cookies"] = {
+                "ezproxy_authenticated": "true",
+                "institution": chosen_university,
+                "access_token": "academic_access_" + str(int(time.time())),
+            }
+
+            # Use a mix of academic and standard referrers
+            referrers = [
+                f"https://library.{chosen_university.lower()}.edu/find/",
+                "https://scholar.google.com/scholar?q=",
+                "https://www.google.com/search?q=",
+                "https://www.bing.com/search?q=",
+                "https://search.yahoo.com/search?p=",
+                "https://www.scopus.com/record/display.uri",
+                "https://www.webofscience.com/wos/woscc/full-record/",
+                "https://www.sciencedirect.com/search?",
+                "https://www.base-search.net/Search/Results?",
+            ]
+
+            # Create rich search terms
+            search_terms = [
+                parsed_url.path.split("/")[-1].replace(".pdf", "").replace("-", " "),
+                (
+                    "doi " + parsed_url.path.split("/")[-1]
+                    if "/" in parsed_url.path
+                    else domain
+                ),
+                domain + " research",
+                domain + " " + query if "query" in locals() else domain,
+                query if "query" in locals() else domain + " publication",
+            ]
+
+            # Filter out empty or very short ones
+            search_terms = [term for term in search_terms if len(term.strip()) > 3]
+
+            # Choose a referrer and term - use hash of domain for consistency while still appearing varied
+            domain_hash = hash(domain)
+            chosen_referrer = referrers[domain_hash % len(referrers)]
+            search_term = search_terms[0] if search_terms else domain
+            if len(search_terms) > 1:
+                search_term = search_terms[domain_hash % len(search_terms)]
+
+            # Apply the search term
+            search_term = search_term.replace(" ", "+")
+            headers["Referer"] = chosen_referrer + search_term
+
+            # Update domain tracking info
+            if domain not in domain_session_map:
+                domain_session_map[domain] = {
+                    "cookies": {},
+                    "last_visit": 0,
+                    "visit_count": 0,
+                }
+
+            domain_session = domain_session_map[domain]
+            domain_session["visit_count"] += 1
+
+            domain_session["last_visit"] = time.time()
+            self.update_state("domain_session_map", domain_session_map)
+
+            # Create connector with SSL verification disabled and keep session open
+            connector = aiohttp.TCPConnector(verify_ssl=False, force_close=True)
+
+            # Check if URL appears to be a PDF
+            is_pdf = url.lower().endswith(".pdf")
+
+            # Get existing cookies for this domain if available
+            cookie_dict = {}
+            if domain in domain_session_map:
+                # Convert stored cookies to dictionary format for ClientSession
+                stored_cookies = domain_session_map[domain].get("cookies", {})
+
+                # Handle both dictionary and CookieJar formats
+                if isinstance(stored_cookies, dict):
+                    cookie_dict = stored_cookies
+                else:
+                    # Try to extract cookies from CookieJar
+                    try:
+                        for cookie_name, cookie in stored_cookies.items():
+                            cookie_dict[cookie_name] = cookie.value
+                    except AttributeError:
+                        # If that fails, use an empty dict
+                        cookie_dict = {}
+
+            async with aiohttp.ClientSession(
+                connector=connector, cookies=cookie_dict
+            ) as session:
+                if is_pdf:
+                    # Use binary mode for PDFs
+                    async with session.get(
+                        url, headers=headers, timeout=20.0
+                    ) as response:
+                        # Store cookies for future requests
+                        if domain in domain_session_map:
+                            domain_session_map[domain]["cookies"] = (
+                                session.cookie_jar.filter_cookies(url)
+                            )
+                            self.update_state("domain_session_map", domain_session_map)
+
+                        if response.status == 200:
+                            # Get PDF content as bytes
+                            pdf_content = await response.read()
+                            self.is_pdf_content = True  # Set the PDF flag
+                            extracted_content = await self.extract_text_from_pdf(
+                                pdf_content
+                            )
+
+                            # Limit cached content to 3x MAX_SOURCE_TOKENS
+                            if extracted_content:
+                                tokens = await self.count_tokens(extracted_content)
+                                token_limit = self.valves.MAX_SOURCE_TOKENS * 3
+                                if tokens > token_limit:
+                                    char_limit = int(
+                                        len(extracted_content) * (token_limit / tokens)
+                                    )
+                                    extracted_content_to_cache = extracted_content[
+                                        :char_limit
+                                    ]
+                                    logger.info(
+                                        f"Limiting cached PDF content for URL {url} from {tokens} to {token_limit} tokens"
+                                    )
+                                else:
+                                    extracted_content_to_cache = extracted_content
+
+                                url_results_cache[url] = extracted_content_to_cache
+                            else:
+                                url_results_cache[url] = extracted_content
+
+                            self.update_state("url_results_cache", url_results_cache)
+
+                            # Add to source table
+                            if url not in source_table:
+                                title = (
+                                    url.split("/")[-1]
+                                    .replace(".pdf", "")
+                                    .replace("-", " ")
+                                    .replace("_", " ")
+                                )
+                                source_id = f"S{len(source_table) + 1}"
+                                source_table[url] = {
+                                    "id": source_id,
+                                    "title": title,
+                                    "content_preview": extracted_content[:500],
+                                    "source_type": "pdf",
+                                    "accessed_date": self.search_date,
+                                }
+                                self.update_state("source_table", source_table)
+
+                            return extracted_content
+                        elif response.status == 403 or response.status == 271:
+                            # Try archive.org for 403 errors
+                            logger.info(
+                                f"Received 403 for PDF {url}, trying archive.org"
+                            )
+                            archive_content = await self.fetch_from_archive(
+                                url, session
+                            )
+                            if archive_content:
+                                return archive_content
+
+                            # If archive fallback fails, return original error
+                            logger.error(
+                                f"Error fetching URL {url}: HTTP {response.status} (archive fallback failed)"
+                            )
+                            return (
+                                f"Error fetching content: HTTP status {response.status}"
+                            )
+                        else:
+                            logger.error(
+                                f"Error fetching URL {url}: HTTP {response.status}"
+                            )
+                            return (
+                                f"Error fetching content: HTTP status {response.status}"
+                            )
+                else:
+                    # Normal text/HTML mode
+                    async with session.get(
+                        url, headers=headers, timeout=20.0
+                    ) as response:
+                        # Store cookies for future requests
+                        if domain in domain_session_map:
+                            domain_session_map[domain]["cookies"] = (
+                                session.cookie_jar.filter_cookies(url)
+                            )
+                            self.update_state("domain_session_map", domain_session_map)
+
+                        if response.status == 200:
+                            # Check content type in response headers
+                            content_type = response.headers.get(
+                                "Content-Type", ""
+                            ).lower()
+
+                            if "application/pdf" in content_type:
+                                # This is a PDF even though the URL didn't end with .pdf
+                                pdf_content = await response.read()
+                                self.is_pdf_content = True  # Set the PDF flag
+                                extracted_content = await self.extract_text_from_pdf(
+                                    pdf_content
+                                )
+
+                                # Limit cached content to 3x MAX_SOURCE_TOKENS
+                                if extracted_content:
+                                    tokens = await self.count_tokens(extracted_content)
+                                    token_limit = self.valves.MAX_SOURCE_TOKENS * 3
+                                    if tokens > token_limit:
+                                        char_limit = int(
+                                            len(extracted_content)
+                                            * (token_limit / tokens)
+                                        )
+                                        extracted_content_to_cache = extracted_content[
+                                            :char_limit
+                                        ]
+                                        logger.info(
+                                            f"Limiting cached PDF content for URL {url} from {tokens} to {token_limit} tokens"
+                                        )
+                                    else:
+                                        extracted_content_to_cache = extracted_content
+
+                                    url_results_cache[url] = extracted_content_to_cache
+                                else:
+                                    url_results_cache[url] = extracted_content
+
+                                self.update_state(
+                                    "url_results_cache", url_results_cache
+                                )
+
+                                # Add to source table
+                                if url not in source_table:
+                                    title = url.split("/")[-1]
+                                    if not title or title == "/":
+                                        parsed_url = urlparse(url)
+                                        title = f"PDF from {parsed_url.netloc}"
+
+                                    source_id = f"S{len(source_table) + 1}"
+                                    source_table[url] = {
+                                        "id": source_id,
+                                        "title": title,
+                                        "content_preview": extracted_content[:500],
+                                        "source_type": "pdf",
+                                        "accessed_date": self.search_date,
+                                    }
+                                    self.update_state("source_table", source_table)
+
+                                return extracted_content
+
+                            # Handle as normal HTML/text
+                            content = await response.text()
+                            self.is_pdf_content = False  # Clear the PDF flag
+                            if (
+                                self.valves.EXTRACT_CONTENT_ONLY
+                                and content.strip().startswith("<")
+                            ):
+                                extracted = await self.extract_text_from_html(content)
+
+                                # Limit cached content to 3x MAX_SOURCE_TOKENS
+                                if extracted:
+                                    tokens = await self.count_tokens(extracted)
+                                    token_limit = self.valves.MAX_SOURCE_TOKENS * 3
+                                    if tokens > token_limit:
+                                        char_limit = int(
+                                            len(extracted) * (token_limit / tokens)
+                                        )
+                                        extracted_to_cache = extracted[:char_limit]
+                                        logger.info(
+                                            f"Limiting cached HTML content for URL {url} from {tokens} to {token_limit} tokens"
+                                        )
+                                    else:
+                                        extracted_to_cache = extracted
+
+                                    url_results_cache[url] = extracted_to_cache
+                                else:
+                                    url_results_cache[url] = extracted
+
+                                self.update_state(
+                                    "url_results_cache", url_results_cache
+                                )
+
+                                # Add to source table
+                                if url not in source_table:
+                                    # Try to extract title
+                                    title = url
+                                    title_match = re.search(
+                                        r"<title>(.*?)</title>",
+                                        content,
+                                        re.IGNORECASE | re.DOTALL,
+                                    )
+                                    if title_match:
+                                        title = title_match.group(1).strip()
+                                    else:
+                                        # Use domain as title
+                                        parsed_url = urlparse(url)
+                                        title = parsed_url.netloc
+
+                                    source_id = f"S{len(source_table) + 1}"
+                                    source_table[url] = {
+                                        "id": source_id,
+                                        "title": title,
+                                        "content_preview": extracted[:500],
+                                        "source_type": "web",
+                                        "accessed_date": self.search_date,
+                                    }
+                                    self.update_state("source_table", source_table)
+
+                                return extracted
+
+                            # Limit cached content to 3x MAX_SOURCE_TOKENS
+                            if isinstance(content, str):
+                                tokens = await self.count_tokens(content)
+                                token_limit = self.valves.MAX_SOURCE_TOKENS * 3
+                                if tokens > token_limit:
+                                    char_limit = int(
+                                        len(content) * (token_limit / tokens)
+                                    )
+                                    content_to_cache = content[:char_limit]
+                                    logger.info(
+                                        f"Limiting cached content for URL {url} from {tokens} to {token_limit} tokens"
+                                    )
+                                else:
+                                    content_to_cache = content
+
+                                url_results_cache[url] = content_to_cache
+                            else:
+                                url_results_cache[url] = content
+
+                            self.update_state("url_results_cache", url_results_cache)
+
+                            # Add to source table
+                            if url not in source_table:
+                                # Try to extract title
+                                title = url
+                                title_match = re.search(
+                                    r"<title>(.*?)</title>",
+                                    content,
+                                    re.IGNORECASE | re.DOTALL,
+                                )
+                                if title_match:
+                                    title = title_match.group(1).strip()
+                                else:
+                                    # Use domain as title
+                                    parsed_url = urlparse(url)
+                                    title = parsed_url.netloc
+
+                                source_id = f"S{len(source_table) + 1}"
+                                source_table[url] = {
+                                    "id": source_id,
+                                    "title": title,
+                                    "content_preview": content[:500],
+                                    "source_type": "web",
+                                    "accessed_date": self.search_date,
+                                }
+                                self.update_state("source_table", source_table)
+
+                            return content
+                        elif response.status == 403 or response.status == 271:
+                            # Try archive.org for 403 errors
+                            logger.info(
+                                f"Received 403 for URL {url}, trying archive.org"
+                            )
+                            archive_content = await self.fetch_from_archive(
+                                url, session
+                            )
+                            if archive_content:
+                                return archive_content
+
+                            # If archive fallback fails, return original error
+                            logger.error(
+                                f"Error fetching URL {url}: HTTP {response.status} (archive fallback failed)"
+                            )
+                            return (
+                                f"Error fetching content: HTTP status {response.status}"
+                            )
+                        else:
+                            logger.error(
+                                f"Error fetching URL {url}: HTTP {response.status}"
+                            )
+                            return (
+                                f"Error fetching content: HTTP status {response.status}"
+                            )
+
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout fetching content from {url}")
+            return f"Timeout while fetching content from {url}"
+        except aiohttp.ClientConnectorError as e:
+            logger.error(f"Connection error for {url}: {e}")
+            return f"Connection error: {str(e)}"
+        except aiohttp.ClientOSError as e:
+            logger.error(f"OS error for {url}: {e}")
+            return f"Connection error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Error fetching content from {url}: {e}")
+            return f"Error fetching content: {str(e)}"
+
+    async def fetch_from_archive(self, url: str, session=None) -> str:
+        """Fetch content from the Internet Archive (archive.org)"""
+        try:
+            # Construct Wayback Machine URL
+            wayback_api_url = f"https://archive.org/wayback/available?url={url}"
+
+            # Create a new session if not provided
+            close_session = False
+            if session is None:
+                close_session = True
+                connector = aiohttp.TCPConnector(verify_ssl=False, force_close=True)
+                session = aiohttp.ClientSession(connector=connector)
+
+            try:
+                # First check if the URL is archived
+                async with session.get(wayback_api_url, timeout=15.0) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        # Check if there are archived snapshots
+                        snapshots = data.get("archived_snapshots", {})
+                        closest = snapshots.get("closest", {})
+                        archived_url = closest.get("url")
+
+                        if archived_url:
+                            logger.info(f"Found archive for {url}: {archived_url}")
+                            # Fetch the content from the archived URL
+                            async with session.get(
+                                archived_url, timeout=20.0
+                            ) as archive_response:
+                                if archive_response.status == 200:
+                                    content_type = archive_response.headers.get(
+                                        "Content-Type", ""
+                                    ).lower()
+
+                                    if "application/pdf" in content_type:
+                                        # Handle PDF from archive
+                                        pdf_content = await archive_response.read()
+                                        self.is_pdf_content = True
+                                        extracted_content = (
+                                            await self.extract_text_from_pdf(
+                                                pdf_content
+                                            )
+                                        )
+
+                                        # Cache the archived content
+                                        state = self.get_state()
+                                        url_results_cache = state.get(
+                                            "url_results_cache", {}
+                                        )
+                                        url_results_cache[url] = extracted_content
+                                        self.update_state(
+                                            "url_results_cache", url_results_cache
+                                        )
+
+                                        # Update source table
+                                        source_table = state.get("source_table", {})
+                                        if url not in source_table:
+                                            title = f"Archived PDF: {url.split('/')[-1].replace('.pdf','').replace('-',' ').replace('_',' ')}"
+                                            source_id = f"S{len(source_table) + 1}"
+                                            source_table[url] = {
+                                                "id": source_id,
+                                                "title": title,
+                                                "content_preview": extracted_content[
+                                                    :500
+                                                ],
+                                                "source_type": "pdf",
+                                                "accessed_date": self.search_date,
+                                                "archived": True,
+                                            }
+                                            self.update_state(
+                                                "source_table",
+                                                source_table,
+                                            )
+
+                                        return extracted_content
+                                    else:
+                                        # Handle HTML/text from archive
+                                        content = await archive_response.text()
+                                        self.is_pdf_content = False
+
+                                        # Extract and clean text if needed
+                                        if (
+                                            self.valves.EXTRACT_CONTENT_ONLY
+                                            and content.strip().startswith("<")
+                                        ):
+                                            extracted = (
+                                                await self.extract_text_from_html(
+                                                    content
+                                                )
+                                            )
+
+                                            # Cache the extracted content
+                                            state = self.get_state()
+                                            url_results_cache = state.get(
+                                                "url_results_cache", {}
+                                            )
+                                            url_results_cache[url] = extracted
+                                            self.update_state(
+                                                "url_results_cache", url_results_cache
+                                            )
+
+                                            # Update source table
+                                            source_table = state.get("source_table", {})
+                                            if url not in source_table:
+                                                title = f"Archived: {url}"
+                                                title_match = re.search(
+                                                    r"<title>(.*?)</title>",
+                                                    content,
+                                                    re.IGNORECASE | re.DOTALL,
+                                                )
+                                                if title_match:
+                                                    title = f"Archived: {title_match.group(1).strip()}"
+
+                                                source_id = f"S{len(source_table) + 1}"
+                                                source_table[url] = {
+                                                    "id": source_id,
+                                                    "title": title,
+                                                    "content_preview": extracted[:500],
+                                                    "source_type": "web",
+                                                    "accessed_date": self.search_date,
+                                                    "archived": True,
+                                                }
+                                                self.update_state(
+                                                    "source_table",
+                                                    source_table,
+                                                )
+
+                                            return extracted
+                                        else:
+                                            # Cache the raw content
+                                            state = self.get_state()
+                                            url_results_cache = state.get(
+                                                "url_results_cache", {}
+                                            )
+                                            url_results_cache[url] = content
+                                            self.update_state(
+                                                "url_results_cache", url_results_cache
+                                            )
+                                            return content
+                        else:
+                            logger.warning(f"No archived version found for {url}")
+                            return ""
+                    else:
+                        logger.warning(
+                            f"Error accessing archive.org API: {response.status}"
+                        )
+                        return ""
+            finally:
+                # Close the session if we created it
+                if close_session and session:
+                    await session.close()
+
+        except Exception as e:
+            logger.error(f"Error fetching from archive.org: {e}")
+            return ""
+
+    async def extract_text_from_pdf(self, pdf_content) -> str:
+        """Extract text from PDF content using PyPDF2 or pdfplumber"""
+        if not self.valves.HANDLE_PDFS:
+            return "PDF processing is disabled in settings."
+
+        # Ensure we have bytes for the PDF content
+        if isinstance(pdf_content, str):
+            if pdf_content.startswith("%PDF"):
+                pdf_content = pdf_content.encode("utf-8", errors="ignore")
+            else:
+                return "Error: Invalid PDF content format"
+
+        # Limit extraction to configured max pages to avoid too much processing
+        max_pages = self.valves.PDF_MAX_PAGES
+
+        try:
+            # Try PyPDF2 first
+            try:
+                import io
+                from PyPDF2 import PdfReader
+
+                # Use ThreadPoolExecutor for CPU-intensive PDF processing
+                def extract_with_pypdf():
+                    try:
+                        # Create a reader object
+                        pdf_file = io.BytesIO(pdf_content)
+                        pdf_reader = PdfReader(pdf_file)
+
+                        # Get the total number of pages
+                        num_pages = len(pdf_reader.pages)
+                        logger.info(
+                            f"PDF has {num_pages} pages, extracting up to {max_pages}"
+                        )
+
+                        # Extract text from each page up to the limit
+                        text = []
+                        for page_num in range(min(num_pages, max_pages)):
+                            try:
+                                page = pdf_reader.pages[page_num]
+                                page_text = page.extract_text() or ""
+                                if page_text.strip():
+                                    text.append(f"Page {page_num + 1}:\n{page_text}")
+                            except Exception as e:
+                                logger.warning(f"Error extracting page {page_num}: {e}")
+
+                        # Join all pages with spacing
+                        full_text = "\n\n".join(text)
+
+                        # Add a note if we limited the page count
+                        if num_pages > max_pages:
+                            full_text += f"\n\n[Note: This PDF has {num_pages} pages, but only the first {max_pages} were processed.]"
+
+                        return full_text if full_text.strip() else None
+                    except Exception as e:
+                        logger.error(f"Error in PDF extraction with PyPDF2: {e}")
+                        return None
+
+                # Execute in thread pool
+                loop = asyncio.get_event_loop()
+                pdf_extract_task = loop.run_in_executor(
+                    self.executor, extract_with_pypdf
+                )
+                full_text = await pdf_extract_task
+
+                if full_text and full_text.strip():
+                    logger.info(
+                        f"Successfully extracted text from PDF using PyPDF2: {len(full_text)} chars"
+                    )
+                    return full_text
+                else:
+                    logger.warning(
+                        "PyPDF2 extraction returned empty text, trying pdfplumber..."
+                    )
+            except (ImportError, Exception) as e:
+                logger.warning(f"PyPDF2 extraction failed: {e}, trying pdfplumber...")
+
+            # Try pdfplumber as a fallback
+            try:
+                import io
+                import pdfplumber
+
+                # Use ThreadPoolExecutor for CPU-intensive PDF processing
+                def extract_with_pdfplumber():
+                    try:
+                        pdf_file = io.BytesIO(pdf_content)
+                        with pdfplumber.open(pdf_file) as pdf:
+                            # Get total pages
+                            num_pages = len(pdf.pages)
+
+                            text = []
+                            for i, page in enumerate(pdf.pages[:max_pages]):
+                                try:
+                                    page_text = page.extract_text() or ""
+                                    if page_text.strip():
+                                        text.append(f"Page {i + 1}:\n{page_text}")
+                                except Exception as page_error:
+                                    logger.warning(
+                                        f"Error extracting page {i} with pdfplumber: {page_error}"
+                                    )
+
+                            full_text = "\n\n".join(text)
+
+                            # Add a note if we limited the page count
+                            if num_pages > max_pages:
+                                full_text += f"\n\n[Note: This PDF has {num_pages} pages, but only the first {max_pages} were processed.]"
+
+                            return full_text
+                    except Exception as e:
+                        logger.error(f"Error in PDF extraction with pdfplumber: {e}")
+                        return None
+
+                # Execute in thread pool
+                loop = asyncio.get_event_loop()
+                pdf_extract_task = loop.run_in_executor(
+                    self.executor, extract_with_pdfplumber
+                )
+                full_text = await pdf_extract_task
+
+                if full_text and full_text.strip():
+                    logger.info(
+                        f"Successfully extracted text from PDF using pdfplumber: {len(full_text)} chars"
+                    )
+                    return full_text
+                else:
+                    logger.warning("pdfplumber extraction returned empty text")
+            except (ImportError, Exception) as e:
+                logger.warning(f"pdfplumber extraction failed: {e}")
+
+            # If both methods failed but we can tell it's a PDF, provide a more useful message
+            if pdf_content.startswith(b"%PDF"):
+                logger.warning(
+                    "PDF detected but text extraction failed. May be scanned or encrypted."
+                )
+                return "This appears to be a PDF document, but text extraction failed. The PDF may contain scanned images rather than text, or it may be encrypted/protected."
+
+            return "Could not extract text from PDF. The file may not be a valid PDF or may contain security restrictions."
+
+        except Exception as e:
+            logger.error(f"PDF text extraction failed: {e}")
+            return f"Error extracting text from PDF: {str(e)}"
+
+    async def sanitize_query(self, query: str) -> str:
+        """Sanitize search query by removing quotes and handling special characters"""
+        # Remove quotes that might cause problems with search engines
+        sanitized = query.replace('"', " ").replace('"', " ").replace('"', " ")
+
+        # Replace multiple spaces with a single space
+        sanitized = " ".join(sanitized.split())
+
+        # Ensure the query isn't too long
+        if len(sanitized) > 250:
+            sanitized = sanitized[:250]
+
+        logger.info(f"Sanitized query: '{query}' -> '{sanitized}'")
+        return sanitized
+
+    async def calculate_preference_impact(self, kept_items, removed_items):
+        """Calculate the impact of user preferences based on the proportion modified"""
+        if not kept_items or not removed_items:
+            return 0.0
+
+        # Calculate impact based on proportion of items removed
+        total_items = len(kept_items) + len(removed_items)
+        if total_items == 0:
+            return 0.0
+
+        impact = len(removed_items) / total_items
+        logger.info(
+            f"User preference impact: {impact:.3f} ({len(removed_items)}/{total_items} items removed)"
+        )
+        return impact
+
+    async def calculate_preference_direction_vector(
+        self, kept_items: List[str], removed_items: List[str]
+    ) -> Dict:
+        """Calculate the Preference Direction Vector based on kept and removed items"""
+        if not kept_items or not removed_items:
+            return {"pdv": None, "strength": 0.0, "impact": 0.0}
+
+        # Get embeddings for kept and removed items sequentially
+        kept_embeddings = []
+        for item in kept_items:
+            embedding = await self.get_embedding(item)
+            if embedding:
+                kept_embeddings.append(embedding)
+
+        removed_embeddings = []
+        for item in removed_items:
+            embedding = await self.get_embedding(item)
+            if embedding:
+                removed_embeddings.append(embedding)
+
+        if not kept_embeddings or not removed_embeddings:
+            return {"pdv": None, "strength": 0.0, "impact": 0.0}
+
+        try:
+            # Calculate mean vectors
+            kept_mean = np.mean(kept_embeddings, axis=0)
+            removed_mean = np.mean(removed_embeddings, axis=0)
+
+            # Check for NaN or Inf values
+            if (
+                np.isnan(kept_mean).any()
+                or np.isnan(removed_mean).any()
+                or np.isinf(kept_mean).any()
+                or np.isinf(removed_mean).any()
+            ):
+                logger.warning("Invalid values in kept or removed mean vectors")
+                return {"pdv": None, "strength": 0.0, "impact": 0.0}
+
+            # Calculate the preference direction vector
+            pdv = kept_mean - removed_mean
+
+            # Normalize the vector
+            pdv_norm = np.linalg.norm(pdv)
+            if pdv_norm < 1e-10:
+                logger.warning("PDV has near-zero norm")
+                return {"pdv": None, "strength": 0.0, "impact": 0.0}
+
+            pdv = pdv / pdv_norm
+
+            # Calculate preference strength (distance between centroids)
+            strength = np.linalg.norm(kept_mean - removed_mean)
+
+            # Calculate impact factor based on proportion of items removed
+            impact = await self.calculate_preference_impact(kept_items, removed_items)
+
+            return {"pdv": pdv.tolist(), "strength": float(strength), "impact": impact}
+        except Exception as e:
+            logger.error(f"Error calculating PDV: {e}")
+            return {"pdv": None, "strength": 0.0, "impact": 0.0}
+
+    async def create_context_vocabulary(
+        self, context_text: str, min_size: int = 1000
+    ) -> List[str]:
+        """Create a vocabulary from recent context when standard vocabulary is unavailable"""
+        logger.info("Creating vocabulary from context as fallback")
+
+        # Extract words from context
+        words = re.findall(r"\b[a-zA-Z]{4,}\b", context_text.lower())
+
+        # Get unique words
+        unique_words = list(set(words))
+        logger.info(f"Created context vocabulary with {len(unique_words)} words")
+
+        return unique_words
+
+    async def load_vocabulary(self):
+        """Load the 10,000 word vocabulary for semantic analysis"""
+        if self.vocabulary_cache is not None:
+            return self.vocabulary_cache
+
+        try:
+            url = "https://www.mit.edu/~ecprice/wordlist.10000"
+            connector = aiohttp.TCPConnector(force_close=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(url, timeout=10) as response:
+                    if response.status == 200:
+                        text = await response.text()
+                        self.vocabulary_cache = [
+                            word.strip() for word in text.splitlines() if word.strip()
+                        ]
+                        logger.info(
+                            f"Loaded {len(self.vocabulary_cache)} words vocabulary"
+                        )
+                        return self.vocabulary_cache
+        except Exception as e:
+            logger.error(f"Error loading vocabulary: {e}")
+
+            # Use context to create a vocabulary if standard one is unavailable
+            # Get recent context from results history or any available text
+            context_text = ""
+            state = self.get_state()
+            results_history = state.get("results_history", [])
+            search_history = state.get("search_history", [])
+            section_synthesized_content = state.get("section_synthesized_content", {})
+
+            if results_history:
+                # Use the last few results
+                for result in results_history[-5:]:
+                    context_text += result.get("content", "") + " "
+
+            # Add any research queries
+            if search_history:
+                context_text += " ".join(search_history) + " "
+
+            # Add any section content
+            if section_synthesized_content:
+                for content in list(section_synthesized_content.values())[:3]:
+                    context_text += content + " "
+
+            # If we still don't have enough context, just proceed with failure logging
+            if len(context_text) < 5000:
+                logger.error("Insufficient context for vocabulary creation")
+                return None
+
+            # Create vocabulary from context
+            self.vocabulary_cache = await self.create_context_vocabulary(context_text)
+            return self.vocabulary_cache
+
+    async def load_prebuilt_vocabulary_embeddings(self):
+        """Download and load pre-built vocabulary embeddings from GitHub"""
+        try:
+            logger.info("Attempting to download pre-built vocabulary embeddings")
+            url = "https://github.com/atineiatte/deep-research-at-home/raw/main/granite30m%20mit%2010k.gz"
+
+            # Download the compressed file
+            connector = aiohttp.TCPConnector(force_close=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(url, timeout=30) as response:
+                    if response.status == 200:
+                        # Create a temporary file
+                        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                            temp_filename = temp_file.name
+                            # Write the compressed data to the temporary file
+                            temp_file.write(await response.read())
+
+                        # Decompress and load the embeddings
+                        try:
+                            with gzip.open(temp_filename, "rt", encoding="utf-8") as f:
+                                data = json.load(f)
+
+                            # Clean up the temporary file
+                            os.unlink(temp_filename)
+
+                            # Convert the data to the expected format
+                            self.vocabulary_cache = []
+                            self.vocabulary_embeddings = {}
+
+                            for word, embedding in data.items():
+                                self.vocabulary_cache.append(word)
+                                self.vocabulary_embeddings[word] = embedding
+
+                            logger.info(
+                                f"Successfully loaded {len(self.vocabulary_embeddings)} pre-built vocabulary embeddings"
+                            )
+
+                            # Store in state for persistence across calls
+                            self.update_state(
+                                "vocabulary_embeddings", self.vocabulary_embeddings
+                            )
+
+                            return self.vocabulary_embeddings
+                        except Exception as e:
+                            logger.error(
+                                f"Error decompressing or parsing embeddings: {e}"
+                            )
+                            # Clean up the temporary file if it exists
+                            if os.path.exists(temp_filename):
+                                os.unlink(temp_filename)
+                    else:
+                        logger.warning(
+                            f"Failed to download pre-built embeddings: HTTP {response.status}"
+                        )
+
+            # If we get here, something went wrong - fall back to original method
+            logger.info("Falling back to on-demand vocabulary embedding generation")
+            return await self.load_vocabulary_embeddings()
+
+        except Exception as e:
+            logger.error(f"Error downloading pre-built vocabulary embeddings: {e}")
+            # Fall back to the original method
+            logger.info("Falling back to on-demand vocabulary embedding generation")
+            return await self.load_vocabulary_embeddings()
+
+    async def load_vocabulary_embeddings(self):
+        """Get embeddings for vocabulary words using existing batch processing or pre-built embeddings"""
+        # If we already have the embeddings, return them
+        if self.vocabulary_embeddings is not None:
+            return self.vocabulary_embeddings
+
+        # Check if we have them in state
+        state = self.get_state()
+        cached_embeddings = state.get("vocabulary_embeddings")
+        if cached_embeddings:
+            self.vocabulary_embeddings = cached_embeddings
+            logger.info(
+                f"Loaded {len(self.vocabulary_embeddings)} vocabulary embeddings from state"
+            )
+            return self.vocabulary_embeddings
+
+        # Try to load pre-built embeddings first
+        prebuilt_embeddings = await self.load_prebuilt_vocabulary_embeddings()
+        if prebuilt_embeddings:
+            return prebuilt_embeddings
+
+        # If pre-built embeddings failed, load vocabulary and generate embeddings
+        vocab = await self.load_vocabulary()
+        if not vocab:
+            logger.error("Failed to load vocabulary for embeddings")
+            return {}
+
+        self.vocabulary_embeddings = {}
+
+        # Log the start of embedding process
+        logger.info(f"Preloading embeddings for {len(vocab)} vocabulary words")
+
+        # Process words sequentially
+        for i, word in enumerate(vocab):
+            if i % 100 == 0:  # Log progress every 100 words
+                logger.info(f"Processing vocabulary word {i}/{len(vocab)}")
+
+            # Get embedding for this word
+            embedding = await self.get_embedding(word)
+            if embedding:
+                self.vocabulary_embeddings[word] = embedding
+
+        logger.info(
+            f"Generated embeddings for {len(self.vocabulary_embeddings)} vocabulary words"
+        )
+
+        # Store in state for persistence across calls
+        self.update_state("vocabulary_embeddings", self.vocabulary_embeddings)
+
+        return self.vocabulary_embeddings
+
+    async def translate_pdv_to_words(self, pdv):
+        """Translate a Preference Direction Vector (PDV) into human-readable concepts using vocabulary embeddings"""
+        if not pdv:
+            return None
+
+        # Ensure we have vocabulary embeddings
+        if not self.vocabulary_embeddings:
+            # If not loaded yet, load them now
+            self.vocabulary_embeddings = await self.load_vocabulary_embeddings()
+
+        if not self.vocabulary_embeddings:
+            return None
+
+        try:
+            # Convert PDV to numpy array
+            pdv_array = np.array(pdv)
+
+            # Find vocabulary words that align with this direction
+            word_alignments = []
+            for word, embedding in self.vocabulary_embeddings.items():
+                # Calculate alignment (dot product) with PDV
+                alignment = np.dot(pdv_array, embedding)
+                word_alignments.append((word, alignment))
+
+            # Get top aligned words (highest dot product)
+            top_words = sorted(word_alignments, key=lambda x: x[1], reverse=True)[:10]
+
+            # Return as comma-separated string
+            return ", ".join([word for word, _ in top_words])
+        except Exception as e:
+            logger.error(f"Error translating PDV to words: {e}")
+            return None
+
+    async def _try_openwebui_search(self, query: str) -> List[Dict]:
+        """Try to use Open WebUI's built-in search functionality"""
+        try:
+            from open_webui.routers.retrieval import process_web_search, SearchForm
+
+            # Create a search form with the query
+            search_form = SearchForm(query=query)
+
+            # Call the search function
+            logger.debug(f"Executing built-in search with query: {query}")
+
+            # Set a timeout for this operation
+            search_task = asyncio.create_task(
+                process_web_search(self.__request__, search_form, user=self.__user__)
+            )
+            search_results = await asyncio.wait_for(search_task, timeout=15.0)
+
+            logger.debug(f"Search results received: {type(search_results)}")
+            results = []
+
+            # Get state for URL tracking
+            state = self.get_state()
+            url_selected_count = state.get("url_selected_count", {})
+
+            # Calculate total results to fetch
+            total_results = (
+                self.valves.SEARCH_RESULTS_PER_QUERY
+                + self.valves.EXTRA_RESULTS_PER_QUERY
+            )
+
+            # Process the results
+            if search_results:
+                if "docs" in search_results:
+                    # Extract information from search results
+                    docs = search_results.get("docs", [])
+                    urls = search_results.get("filenames", [])
+
+                    logger.debug(f"Found {len(docs)} documents in search results")
+
+                    # Create a result object for each document
+                    for i, doc in enumerate(docs[:total_results]):
+                        url = urls[i] if i < len(urls) else ""
+                        results.append(
+                            {
+                                "title": f"'{query}'",
+                                "url": url,
+                                "snippet": doc,
+                            }
+                        )
+                elif "collection_name" in search_results:
+                    # For collection-based results
+                    collection_name = search_results.get("collection_name")
+                    urls = search_results.get("filenames", [])
+
+                    logger.debug(
+                        f"Found collection {collection_name} with {len(urls)} documents"
+                    )
+
+                    for i, url in enumerate(urls[:total_results]):
+                        results.append(
+                            {
+                                "title": f"Search Result {i+1} from {collection_name}",
+                                "url": url,
+                                "snippet": f"Result from collection: {collection_name}",
+                            }
+                        )
+
+            return results
+
+        except asyncio.TimeoutError:
+            logger.error(f"OpenWebUI search timed out for query: {query}")
+            return []
+        except Exception as e:
+            logger.error(f"Error in _try_openwebui_search: {str(e)}")
+            return []
+
+    async def _fallback_search(self, query: str) -> List[Dict]:
+        """Fallback search method using direct HTTP request to search API with HTML parsing support"""
+        try:
+            # URL encode the query for safer search
+            from urllib.parse import quote
+
+            encoded_query = quote(query)
+            search_url = f"{self.valves.SEARCH_URL}{encoded_query}"
+
+            logger.debug(f"Using fallback search with URL: {search_url}")
+
+            # Calculate total results to fetch
+            total_results = (
+                self.valves.SEARCH_RESULTS_PER_QUERY
+                + self.valves.EXTRA_RESULTS_PER_QUERY
+            )
+
+            connector = aiohttp.TCPConnector(force_close=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                # Set a timeout for this request
+                async with session.get(search_url, timeout=15.0) as response:
+                    if response.status == 200:
+                        # First try to parse as JSON
+                        try:
+                            search_json = await response.json()
+                            results = []
+
+                            if isinstance(search_json, list):
+                                for i, item in enumerate(search_json[:total_results]):
+                                    results.append(
+                                        {
+                                            "title": item.get("title", f"Result {i+1}"),
+                                            "url": item.get("url", ""),
+                                            "snippet": item.get("snippet", ""),
+                                        }
+                                    )
+                                return results
+                            elif (
+                                isinstance(search_json, dict)
+                                and "results" in search_json
+                            ):
+                                for i, item in enumerate(
+                                    search_json["results"][:total_results]
+                                ):
+                                    results.append(
+                                        {
+                                            "title": item.get("title", f"Result {i+1}"),
+                                            "url": item.get("url", ""),
+                                            "snippet": item.get("snippet", ""),
+                                        }
+                                    )
+                                return results
+                        except (json.JSONDecodeError, aiohttp.ContentTypeError):
+                            # If JSON parsing fails, try HTML parsing with BeautifulSoup
+                            logger.info(
+                                "JSON parsing failed, trying HTML parsing for search results"
+                            )
+                            try:
+                                from bs4 import BeautifulSoup
+
+                                html_content = await response.text()
+                                soup = BeautifulSoup(html_content, "html.parser")
+
+                                results = []
+                                # Parse SearXNG result elements
+                                result_elements = soup.select("article.result")
+
+                                for i, element in enumerate(
+                                    result_elements[:total_results]
+                                ):
+                                    try:
+                                        title_element = element.select_one("h3 a")
+                                        url_element = element.select_one("h3 a")
+                                        snippet_element = element.select_one(
+                                            "p.content"
+                                        )
+
+                                        title = (
+                                            title_element.get_text()
+                                            if title_element
+                                            else f"Result {i+1}"
+                                        )
+                                        url = (
+                                            url_element.get("href")
+                                            if url_element
+                                            else ""
+                                        )
+                                        snippet = (
+                                            snippet_element.get_text()
+                                            if snippet_element
+                                            else ""
+                                        )
+
+                                        results.append(
+                                            {
+                                                "title": title,
+                                                "url": url,
+                                                "snippet": snippet,
+                                            }
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"Error parsing search result {i}: {e}"
+                                        )
+
+                                if results:
+                                    return results
+                                else:
+                                    logger.warning("No results found in HTML parsing")
+                            except ImportError:
+                                logger.warning(
+                                    "BeautifulSoup not available for HTML parsing"
+                                )
+                            except Exception as e:
+                                logger.error(f"Error in HTML parsing: {e}")
+
+                    # If we got this far, the response couldn't be parsed
+                    logger.error(
+                        f"Fallback search returned status code {response.status} but couldn't parse content"
+                    )
+                    return []
+        except asyncio.TimeoutError:
+            logger.error(f"Fallback search timed out for query: {query}")
+            return []
+        except Exception as e:
+            logger.error(f"Error in fallback search: {e}")
+            return []
+
+    async def search_web(self, query: str) -> List[Dict]:
+        """Perform web search with fallbacks"""
+        logger.debug(f"Starting web search for query: {query}")
+
+        # Calculate total results to fetch
+        total_results = (
+            self.valves.SEARCH_RESULTS_PER_QUERY + self.valves.EXTRA_RESULTS_PER_QUERY
+        )
+
+        logger.debug(f"Requesting {total_results} search results")
+
+        # First try OpenWebUI search
+        results = await self._try_openwebui_search(query)
+
+        # If that failed, try fallback search
+        if not results:
+            logger.debug(
+                f"OpenWebUI search returned no results, trying fallback search for: {query}"
+            )
+            results = await self._fallback_search(query)
+
+        # If we got results, return them
+        if results:
+            logger.debug(
+                f"Search successful, found {len(results)} results for: {query}"
+            )
+            return results
+
+        # No results - create a minimal result to continue
+        logger.warning(f"No search results found for query: {query}")
+        return [
+            {
+                "title": f"No results for '{query}'",
+                "url": "",
+                "snippet": f"No search results were found for the query: {query}",
+            }
+        ]
+
+    async def select_most_relevant_results(
+        self,
+        results: List[Dict],
+        query: str,
+        query_embedding: List[float],
+    ) -> List[Dict]:
+        """Select the most relevant results from extra results pool using similarity scoring"""
+        if not results:
+            return results
+
+        # If we only have the base needed amount or fewer, return them all
+        base_results_per_query = self.valves.SEARCH_RESULTS_PER_QUERY
+        if len(results) <= base_results_per_query:
+            return results
+
+        # Calculate relevance scores for each result
+        relevance_scores = []
+
+        # Process domain priority valve value (if provided)
+        priority_domains = []
+        if hasattr(self.valves, "DOMAIN_PRIORITY") and self.valves.DOMAIN_PRIORITY:
+            # Split by commas and/or spaces
+            domain_input = self.valves.DOMAIN_PRIORITY
+            # Replace commas with spaces, then split by spaces
+            domain_items = domain_input.replace(",", " ").split()
+            # Remove empty items and add to priority domains
+            priority_domains = [
+                item.strip().lower() for item in domain_items if item.strip()
+            ]
+            if priority_domains:
+                logger.info(f"Using priority domains: {priority_domains}")
+
+        # Process content priority valve value (if provided)
+        priority_keywords = []
+        if hasattr(self.valves, "CONTENT_PRIORITY") and self.valves.CONTENT_PRIORITY:
+            # Split by commas and/or spaces, handling quoted phrases
+            content_input = self.valves.CONTENT_PRIORITY
+
+            # Function to parse keywords, respecting quotes
+            def parse_keywords(text):
+                keywords = []
+                # Pattern for quoted phrases or words
+                pattern = r"\'([^\']+)\'|\"([^\"]+)\"|(\S+)"
+
+                matches = re.findall(pattern, text)
+                for match in matches:
+                    # Each match is a tuple with three groups (one will contain the text)
+                    keyword = match[0] or match[1] or match[2]
+                    if keyword:
+                        keywords.append(keyword.lower())
+                return keywords
+
+            priority_keywords = parse_keywords(content_input)
+            if priority_keywords:
+                logger.info(f"Using priority keywords: {priority_keywords}")
+
+        # Get multiplier values from valves or use defaults
+        domain_multiplier = getattr(self.valves, "DOMAIN_MULTIPLIER", 1.5)
+        keyword_multiplier_per_match = getattr(
+            self.valves, "KEYWORD_MULTIPLIER_PER_MATCH", 1.1
+        )
+        max_keyword_multiplier = getattr(self.valves, "MAX_KEYWORD_MULTIPLIER", 2.0)
+
+        # Get user preferences
+        state = self.get_state()
+        user_preferences = state.get("user_preferences", {})
+        pdv = user_preferences.get("pdv")
+        pdv_impact = user_preferences.get("impact", 0.0)
+
+        # Get list of URLs we've already seen to filter out duplicates
+        url_seen = set()
+        url_selected_count = state.get("url_selected_count", {})
+
+        for i, result in enumerate(results):
+            try:
+                # Get URL for this result
+                url = result.get("url", "")
+
+                # Skip duplicate URLs
+                if url in url_seen:
+                    continue
+
+                # Add URL to seen set
+                if url:
+                    url_seen.add(url)
+
+                # Get a snippet for evaluation
+                snippet = result.get("snippet", "")
+
+                # If snippet is too short and URL is available, fetch a bit of content
+                if len(snippet) < self.valves.RELEVANCY_SNIPPET_LENGTH and url:
+                    try:
+                        await self.emit_status(
+                            "info",
+                            f"Fetching snippet for relevance check: {url[:50]}...",
+                            False,
+                        )
+                        # Only fetch the first part of the content for evaluation
+                        content_preview = await self.fetch_content(url)
+                        if content_preview:
+                            snippet = content_preview[
+                                : self.valves.RELEVANCY_SNIPPET_LENGTH
+                            ]
+                    except Exception as e:
+                        logger.error(f"Error fetching content for relevance check: {e}")
+
+                # Calculate relevance if we have enough content
+                if snippet and len(snippet) > 100:
+                    # FIRST, CHECK FOR VOCABULARY LIST
+                    words = re.findall(r"\b\w+\b", snippet[:2000].lower())
+                    if len(words) > 150:  # Only check if enough words
+                        unique_words = set(words)
+                        unique_ratio = len(unique_words) / len(words)
+                        if (
+                            unique_ratio > 0.98
+                        ):  # Extremely high uniqueness = vocabulary list
+                            logger.warning(
+                                f"Skipping likely vocabulary list: {unique_ratio:.3f} uniqueness ratio"
+                            )
+                            # Assign a very low similarity score
+                            similarity = 0.01
+                            relevance_scores.append((i, similarity))
+                            result["similarity"] = similarity
+                            continue  # Skip the expensive embedding calculation
+
+                    # Get embedding for the snippet
+                    snippet_embedding = await self.get_embedding(snippet)
+
+                    if snippet_embedding:
+                        # Calculate basic similarity
+                        similarity = cosine_similarity(
+                            [snippet_embedding], [query_embedding]
+                        )[0][0]
+
+                        # Track original similarity for logging
+                        original_similarity = similarity
+
+                        # Apply domain multiplier if priority domains are set
+                        if priority_domains and url:
+                            url_lower = url.lower()
+                            if any(domain in url_lower for domain in priority_domains):
+                                similarity *= domain_multiplier
+                                logger.debug(
+                                    f"Applied domain multiplier {domain_multiplier}x to URL: {url}"
+                                )
+
+                        # Apply keyword multiplier if priority keywords are set
+                        if priority_keywords and snippet:
+                            snippet_lower = snippet.lower()
+                            # Count matching keywords
+                            keyword_matches = [
+                                keyword
+                                for keyword in priority_keywords
+                                if keyword in snippet_lower
+                            ]
+                            keyword_count = len(keyword_matches)
+
+                            if keyword_count > 0:
+                                # Calculate cumulative multiplier (multiply by keyword_multiplier_per_match for each match)
+                                # But cap at max_keyword_multiplier
+                                cumulative_multiplier = min(
+                                    max_keyword_multiplier,
+                                    keyword_multiplier_per_match**keyword_count,
+                                )
+                                similarity *= cumulative_multiplier
+                                logger.debug(
+                                    f"Applied keyword multiplier {cumulative_multiplier:.2f}x "
+                                    f"({keyword_count} keywords matched: {', '.join(keyword_matches[:3])}) to result {i}"
+                                )
+
+                        # Apply PDV influence if available
+                        if pdv is not None and pdv_impact > 0.1:
+                            # Calculate alignment between content and PDV
+                            pdv_array = np.array(pdv)
+                            content_array = np.array(snippet_embedding)
+
+                            alignment = np.dot(content_array, pdv_array)
+                            # Normalize to 0-1 range
+                            alignment = (alignment + 1) / 2  # -1,1 -> 0,1
+
+                            # Scale by impact and strength
+                            pdv_factor = (
+                                alignment * pdv_impact * self.valves.PREFERENCE_STRENGTH
+                            )
+
+                            # Apply PDV influence (additive boost)
+                            similarity += pdv_factor
+
+                            logger.debug(
+                                f"Applied PDV factor: +{pdv_factor:.3f} to result similarity"
+                            )
+
+                        # Cap at 0.99 to avoid perfect scores
+                        similarity = min(0.99, similarity)
+
+                        # Log the full transformation if multipliers were applied
+                        if similarity != original_similarity:
+                            logger.info(
+                                f"Result {i} multiplied: {original_similarity:.3f} → {similarity:.3f}"
+                            )
+
+                        # Store similarity in the result object for later use
+                        result["similarity"] = similarity
+
+                        # Store score for sorting
+                        relevance_scores.append((i, similarity))
+                    else:
+                        # No embedding, assign low score
+                        relevance_scores.append((i, 0.1))
+                        result["similarity"] = 0.1
+                else:
+                    # Insufficient content, assign low score
+                    relevance_scores.append((i, 0.0))
+                    result["similarity"] = 0.0
+
+            except Exception as e:
+                logger.error(f"Error calculating relevance for result {i}: {e}")
+                relevance_scores.append((i, 0.0))
+                result["similarity"] = 0.0
+
+        # Sort by relevance score (highest first)
+        relevance_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # Select top results based on the dynamic count
+        selected_indices = [x[0] for x in relevance_scores[:base_results_per_query]]
+        selected_results = [results[i] for i in selected_indices]
+
+        # Log selection information
+        logger.info(
+            f"Selected {len(selected_results)} most relevant results from {len(results)} total"
+        )
+
+        return selected_results
+
+    async def check_result_relevance(
+        self,
+        result: Dict,
+        query: str,
+    ) -> bool:
+        """Check if a search result is relevant to the query using a lightweight model"""
+        if not self.valves.QUALITY_FILTER_ENABLED:
+            return True  # Skip filtering if disabled
+
+        # Get similarity score from result - access it correctly
+        similarity = result.get("similarity", 0.0)
+
+        # Skip filtering for very high similarity scores
+        if similarity >= self.valves.QUALITY_SIMILARITY_THRESHOLD:
+            logger.info(
+                f"Result passed quality filter automatically with similarity {similarity:.3f}"
+            )
+            return True
+
+        # Get content from the result
+        content = result.get("content", "")
+        title = result.get("title", "")
+        url = result.get("url", "")
+
+        if not content or len(content) < 200:
+            logger.warning(
+                f"Content too short for quality filtering, accepting by default"
+            )
+            return True
+
+        # Create prompt for relevance checking
+        relevance_prompt = {
+            "role": "system",
+            "content": """You are a librarian evaluating the relevance of a search result to a search query.
+	Your task is to determine if the content is actually relevant to what the user is searching for.
+	
+	Answer with ONLY "Yes" if the content is relevant to the search query or "No" if it is:
+	- Not related to the core topic
+	- An advertisement disguised as content
+	- About a different product/concept with similar keywords
+	- So general or vague that it provides no substantive information
+	- Littered with HTML or CSS to the point of being unreadable
+
+	Reply with JUST "Yes" or "No" - no explanation or other text.""",
+        }
+
+        # Create context with query and content
+        context = f"Search Query: {query}\n\n"
+        context += f"Result Title: {title}\n"
+        context += f"Result URL: {url}\n\n"
+        context += f"Content:\n{content}\n\n"
+        context += f"""Is the above content relevant to this query: "{query}"? Answer with ONLY 'Yes' or 'No'."""
+
+        try:
+            # Use quality filter model
+            quality_model = self.valves.QUALITY_FILTER_MODEL
+
+            response = await self.generate_completion(
+                quality_model,
+                [relevance_prompt, {"role": "user", "content": context}],
+                temperature=self.valves.TEMPERATURE
+                * 0.2,  # Use low temperature for clearer decision
+            )
+
+            if response and "choices" in response and len(response["choices"]) > 0:
+                answer = response["choices"][0]["message"]["content"].strip().lower()
+
+                # Parse the response to get yes/no
+                is_relevant = "yes" in answer.lower() and "no" not in answer.lower()
+
+                logger.info(
+                    f"Quality check for result: {'RELEVANT' if is_relevant else 'NOT RELEVANT'} (sim={similarity:.3f})"
+                )
+
+                return is_relevant
+            else:
+                logger.warning(
+                    "Failed to get response from quality model, accepting by default"
+                )
+                return True
+
+        except Exception as e:
+            logger.error(f"Error in quality filtering: {e}")
+            return True  # Accept by default on error
+
+    async def process_source(
+        self,
+        result: Dict,
+        query: str,
+        query_embedding: List[float],
+    ) -> Dict:
+        """Process a search result to extract and format source content"""
+        title = result.get("title", "")
+        url = result.get("url", "")
+        snippet = result.get("snippet", "")
+
+        # Require a URL for all sources
+        if not url:
+            return {
+                "title": title or f"Result for '{query}'",
+                "url": "",
+                "content": "This result has no associated URL and cannot be processed.",
+                "query": query,
+                "valid": False,
+            }
+
+        await self.emit_status("info", f"Processing source: {title[:50]}...", False)
+
+        try:
+            # Get state
+            state = self.get_state()
+            url_selected_count = state.get("url_selected_count", {})
+            url_token_counts = state.get("url_token_counts", {})
+            source_table = state.get("source_table", {})
+
+            # Check if this is a repeated URL - if so, return as invalid to filter it out
+            if url in url_selected_count and url_selected_count[url] > 0:
+                logger.info(f"Filtering out repeated URL: {url}")
+                return {
+                    "title": title or f"Result for '{query}'",
+                    "url": url,
+                    "content": "This URL has already been processed in a previous query.",
+                    "query": query,
+                    "valid": False,
+                }
+
+            # If the snippet is empty or short but we have a URL, try to fetch content
+            if (not snippet or len(snippet) < 200) and url:
+                await self.emit_status(
+                    "info", f"Fetching content from URL: {url}...", False
+                )
+                content = await self.fetch_content(url)
+
+                if content and len(content) > 200:
+                    snippet = content
+                    logger.debug(
+                        f"Successfully fetched content from URL: {url} ({len(content)} chars)"
+                    )
+                else:
+                    logger.warning(f"Failed to fetch useful content from URL: {url}")
+
+            # If we still don't have useful content, mark as invalid
+            if not snippet or len(snippet) < 200:
+                return {
+                    "title": title or f"Result for '{query}'",
+                    "url": url,
+                    "content": snippet
+                    or f"No substantial content available for this result.",
+                    "query": query,
+                    "valid": False,
+                }
+
+            # Calculate tokens in the content
+            content_tokens = await self.count_tokens(snippet)
+
+            # Apply token limit if needed
+            max_tokens = self.valves.MAX_SOURCE_TOKENS
+
+            if content_tokens > max_tokens:
+                # Simple truncation with some padding
+                try:
+                    await self.emit_status(
+                        "info", "Truncating content to token limit...", False
+                    )
+
+                    # Calculate character position based on token limit
+                    char_ratio = max_tokens / content_tokens
+                    char_limit = int(len(snippet) * char_ratio)
+
+                    # Pad the limit to ensure we have complete sentences
+                    padded_limit = min(len(snippet), int(char_limit * 1.1))
+
+                    # Truncate content
+                    truncated_content = snippet[:padded_limit]
+
+                    # Find a good sentence break point
+                    last_period = truncated_content.rfind(".")
+                    if (
+                        last_period > char_limit * 0.9
+                    ):  # Only use period if it's near the target limit
+                        truncated_content = truncated_content[: last_period + 1]
+
+                    # If we got useful truncated content, use it
+                    if truncated_content and len(truncated_content) > 100:
+                        # Mark URL as actually selected (shown to user)
+                        url_selected_count[url] = url_selected_count.get(url, 0) + 1
+                        self.update_state("url_selected_count", url_selected_count)
+
+                        # Store total tokens for this URL if not already done
+                        if url not in url_token_counts:
+                            url_token_counts[url] = content_tokens
+                            self.update_state("url_token_counts", url_token_counts)
+
+                        # Make sure this URL is in the source table
+                        if url not in source_table:
+                            source_type = "web"
+                            if url.endswith(".pdf") or self.is_pdf_content:
+                                source_type = "pdf"
+
+                            # Try to get or create a good title
+                            if not title or title == f"Result for '{query}'":
+                                from urllib.parse import urlparse
+
+                                parsed_url = urlparse(url)
+                                if source_type == "pdf":
+                                    file_name = parsed_url.path.split("/")[-1]
+                                    title = (
+                                        file_name.replace(".pdf", "")
+                                        .replace("-", " ")
+                                        .replace("_", " ")
+                                    )
+                                else:
+                                    title = parsed_url.netloc
+
+                            source_id = f"S{len(source_table) + 1}"
+                            source_table[url] = {
+                                "id": source_id,
+                                "title": title,
+                                "content_preview": truncated_content[:500],
+                                "source_type": source_type,
+                                "accessed_date": self.search_date,
+                            }
+                            self.update_state("source_table", source_table)
+
+                            # Count tokens in truncated content
+                            tokens = await self.count_tokens(truncated_content)
+
+                            # Add timestamp to the result
+                            result["timestamp"] = datetime.now().strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
+
+                        return {
+                            "title": title,
+                            "url": url,
+                            "content": truncated_content,
+                            "query": query,
+                            "tokens": tokens,
+                            "valid": True,
+                        }
+                except Exception as e:
+                    logger.error(f"Error in token-based truncation: {e}")
+                    # If truncation fails, we'll fall back to using original content with hard limit
+
+            # If we haven't returned yet, use the original content with token limiting
+            # Mark URL as actually selected (shown to user)
+            url_selected_count[url] = url_selected_count.get(url, 0) + 1
+            self.update_state("url_selected_count", url_selected_count)
+
+            # Store total tokens for this URL if not already done
+            if url not in url_token_counts:
+                url_token_counts[url] = content_tokens
+                self.update_state("url_token_counts", url_token_counts)
+
+            # Make sure this URL is in the source table
+            if url not in source_table:
+                source_type = "web"
+                if url.endswith(".pdf") or self.is_pdf_content:
+                    source_type = "pdf"
+
+                # Try to get or create a good title
+                if not title or title == f"Result for '{query}'":
+                    from urllib.parse import urlparse
+
+                    parsed_url = urlparse(url)
+                    if source_type == "pdf":
+                        file_name = parsed_url.path.split("/")[-1]
+                        title = (
+                            file_name.replace(".pdf", "")
+                            .replace("-", " ")
+                            .replace("_", " ")
+                        )
+                    else:
+                        title = parsed_url.netloc
+
+                source_id = f"S{len(source_table) + 1}"
+                source_table[url] = {
+                    "id": source_id,
+                    "title": title,
+                    "content_preview": snippet[:500],
+                    "source_type": source_type,
+                    "accessed_date": self.search_date,
+                }
+                self.update_state("source_table", source_table)
+
+            # If over token limit, truncate
+            if content_tokens > max_tokens:
+                # Estimate character position based on token limit
+                char_ratio = max_tokens / content_tokens
+                char_limit = int(len(snippet) * char_ratio)
+                limited_content = snippet[:char_limit]
+                # Actually count tokens rather than assuming max_tokens
+                tokens = await self.count_tokens(limited_content)
+            else:
+                limited_content = snippet
+                tokens = content_tokens
+
+            # Add timestamp to the result
+            result["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            return {
+                "title": title,
+                "url": url,
+                "content": limited_content,
+                "query": query,
+                "tokens": tokens,
+                "valid": True,
+            }
+
+        except Exception as e:
+            logger.error(f"Unhandled error in process_source: {e}")
+            # Return a failure result
+            error_msg = f"Error processing search result: {str(e)}\n\nOriginal snippet: {snippet[:1000] if snippet else 'No content available'}"
+            tokens = await self.count_tokens(error_msg)
+
+            return {
+                "title": title or f"Error processing result for '{query}'",
+                "url": url,
+                "content": error_msg,
+                "query": query,
+                "tokens": tokens,
+                "valid": False,
+            }
+
+    async def generate_summary(self, source):
+        """Generate a brief summary of the source content"""
+        if not source or not source.get("content", ""):
+            return "No content available to summarize."
+
+        content = source.get("content", "")
+
+        # Create prompt for summary
+        summary_prompt = {
+            "role": "system",
+            "content": """You are an academic scholar describing and summarizing key information from an academic source. 
+            The purpose is for a domain expert human to quickly understand the contents of each source and make their own expert determination on its relevance to their query.
+            Provide a concise 3-4 sentence description of this source. Focus on detailing key facts in a neutral, straightforward matter aimed at a technical audience.
+            Do NOT interpret the content in some lofty way that exaggerates its importance or profundity. The user will determine significance and implications of sources themself.
+            Avoid sentences that talk about "emphasizing needs" or "highlighting concerns" or other generic drivel. Focus on the actual, specific, key details in the source.
+            Your response must ONLY contain the summary, with NO intro or segue or other filler.""",
+        }
+
+        # Truncate content if needed
+        if len(content) > 6000:
+            content = content[:6000] + "..."
+
+        # Create context
+        summary_context = f"Source content to summarize:\n\n{content}\n\n"
+        summary_context += "Please provide a 3-4 sentence summary of this source's key information per your system prompt."
+
+        try:
+            # Generate the summary
+            response = await self.generate_completion(
+                self.valves.RESEARCH_MODEL,
+                [summary_prompt, {"role": "user", "content": summary_context}],
+                temperature=0.3,  # Lower temperature for factual summary
+            )
+
+            if response and "choices" in response and len(response["choices"]) > 0:
+                summary = response["choices"][0]["message"]["content"].strip()
+                return summary
+
+        except Exception as e:
+            logger.error(f"Error generating source summary: {e}")
+
+        # Fallback - extract first sentence or two
+        try:
+            first_sentences = re.split(r"(?<=[.!?])\s+", content, maxsplit=2)
+            if first_sentences:
+                return " ".join(first_sentences[:2])
+        except:
+            pass
+
+        # Ultimate fallback
+        return content[:200] + "..."
+
+    async def process_query(
+        self,
+        query: str,
+        query_embedding: List[float],
+        counter_start: int = 1,  # Starting counter value
+    ) -> List[Dict]:
+        """Process a single search query and get source results with quality filtering"""
+        await self.emit_status("info", f"Searching for: {query}", False)
+
+        # Sanitize the query to make it safer for search engines
+        sanitized_query = await self.sanitize_query(query)
+
+        # Get search results for the query
+        search_results = await self.search_web(sanitized_query)
+        if not search_results:
+            await self.emit_message(f"*No results found for query: {query}*\n\n")
+            return []
+
+        # Always select the most relevant results - this adds similarity scores
+        search_results = await self.select_most_relevant_results(
+            search_results,
+            query,
+            query_embedding,
+        )
+
+        # Process each search result until we have enough successful results
+        successful_results = []
+        failed_count = 0
+
+        # Initialize counter with the starting value passed in
+        current_counter = counter_start
+
+        # Track rejected results for logging
+        rejected_results = []
+
+        for result in search_results:
+            # Stop if we've reached our target of successful results
+            if len(successful_results) >= self.valves.SUCCESSFUL_RESULTS_PER_QUERY:
+                break
+
+            # Stop if we've had too many consecutive failures
+            if failed_count >= self.valves.MAX_FAILED_RESULTS:
+                await self.emit_message(
+                    f"*Skipping remaining results for query: {query} after {failed_count} failures*\n\n"
+                )
+                break
+
+            try:
+                # Process the result
+                processed_result = await self.process_source(
+                    result,
+                    query,
+                    query_embedding,
+                )
+
+                # Make sure similarity is preserved from original result
+                if "similarity" in result and "similarity" not in processed_result:
+                    processed_result["similarity"] = result["similarity"]
+
+                # Check if processing was successful (has substantial content and valid URL)
+                if (
+                    processed_result
+                    and processed_result.get("content")
+                    and len(processed_result.get("content", "")) > 200
+                    and processed_result.get("valid", False)
+                    and processed_result.get("url", "")
+                ):
+                    # Add token count if not already present
+                    if "tokens" not in processed_result:
+                        processed_result["tokens"] = await self.count_tokens(
+                            processed_result["content"]
+                        )
+
+                    # Skip results with less than 200 tokens
+                    if processed_result["tokens"] < 200:
+                        logger.info(
+                            f"Skipping result with only {processed_result['tokens']} tokens (less than minimum 200)"
+                        )
+                        continue
+
+                    # Only apply quality filter for results with low similarity
+                    if (
+                        self.valves.QUALITY_FILTER_ENABLED
+                        and "similarity" in processed_result
+                        and processed_result["similarity"]
+                        < self.valves.QUALITY_SIMILARITY_THRESHOLD
+                    ):
+                        # Check if result is relevant using quality filter
+                        is_relevant = await self.check_result_relevance(
+                            processed_result,
+                            query,
+                        )
+
+                        if not is_relevant:
+                            # Track rejected result
+                            rejected_results.append(
+                                {
+                                    "url": processed_result.get("url", ""),
+                                    "title": processed_result.get("title", ""),
+                                    "similarity": processed_result.get("similarity", 0),
+                                }
+                            )
+                            logger.warning(
+                                f"Rejected irrelevant result: {processed_result.get('url', '')}"
+                            )
+                            continue
+                    else:
+                        # Skip filter for high similarity or when filtering is disabled
+                        logger.info(
+                            f"Skipping quality filter for result: {processed_result.get('similarity', 0):.3f}"
+                        )
+
+                    # Generate a brief summary of the source
+                    processed_result["summary"] = await self.generate_summary(
+                        processed_result
+                    )
+
+                    # Store the source number explicitly
+                    processed_result["source_number"] = current_counter
+
+                    # Add to successful results
+                    successful_results.append(processed_result)
+
+                    # Display this individual source with the correct numbering
+                    source_display = f"**Source {current_counter} for '{query}'**\n"
+                    source_display += f"URL: {processed_result['url']}\n"
+                    source_display += f"Summary: {processed_result['summary']}\n\n"
+                    source_display += "---\n\n"
+
+                    await self.emit_message(source_display)
+
+                    # Increment counter for next source
+                    current_counter += 1
+
+                    # Reset failed count on success
+                    failed_count = 0
+                else:
+                    # Count as a failure
+                    failed_count += 1
+                    logger.warning(
+                        f"Failed to get substantial content from result {len(successful_results) + failed_count} for query: {query}"
+                    )
+
+            except Exception as e:
+                # Count as a failure
+                failed_count += 1
+                logger.error(f"Error processing result for query '{query}': {e}")
+                await self.emit_message(
+                    f"*Error processing a result for query: {query}*\n\n"
+                )
+
+        # If we didn't get any successful results but had rejected ones, use the top rejected result
+        if not successful_results and rejected_results:
+            # Sort rejected results by similarity (descending)
+            sorted_rejected = sorted(
+                rejected_results, key=lambda x: x.get("similarity", 0), reverse=True
+            )
+            top_rejected = sorted_rejected[0]
+
+            logger.info(
+                f"Using top rejected result as fallback: {top_rejected.get('url', '')}"
+            )
+
+            # Try to process the top rejected result again
+            for result in search_results:
+                if result.get("url", "") == top_rejected.get("url", ""):
+                    processed_result = await self.process_source(
+                        result,
+                        query,
+                        query_embedding,
+                    )
+
+                    if processed_result and processed_result.get("valid", False):
+                        # Generate a brief summary of the source
+                        processed_result["summary"] = await self.generate_summary(
+                            processed_result
+                        )
+
+                        # Use the current counter value
+                        processed_result["source_number"] = current_counter
+
+                        successful_results.append(processed_result)
+
+                        # Display this fallback source
+                        source_display = f"**Source {current_counter} for '{query}'**\n"
+                        source_display += f"URL: {processed_result['url']}\n"
+                        source_display += f"Summary: {processed_result['summary']}\n\n"
+                        source_display += "---\n\n"
+
+                        await self.emit_message(source_display)
+
+                        # Increment counter
+                        current_counter += 1
+                        break
+
+        # If we still didn't get any successful results, log this
+        if not successful_results:
+            logger.warning(f"No valid results obtained for query: {query}")
+            await self.emit_message(f"*No valid sources found for query: {query}*\n\n")
+
+        return successful_results
+
+    def get_research_model(self):
+        """Get the appropriate model for research/mechanical tasks"""
+        # Always use the main research model
+        return self.valves.RESEARCH_MODEL
+
+    async def generate_completion(
+        self,
+        model: str,
+        messages: List[Dict],
+        stream: bool = False,
+        temperature: Optional[float] = None,
+    ):
+        """Generate a completion from the specified model"""
+        try:
+            # Use provided temperature or default from valves
+            if temperature is None:
+                temperature = self.valves.TEMPERATURE
+
+            form_data = {
+                "model": model,
+                "messages": messages,
+                "stream": stream,
+                "temperature": temperature,
+                "keep_alive": "10m",
+            }
+
+            response = await generate_chat_completions(
+                self.__request__,
+                form_data,
+                user=self.__user__,
+            )
+
+            return response
+        except Exception as e:
+            logger.error(f"Error generating completion with model {model}: {e}")
+            # Return a minimal valid response structure
+            return {"choices": [{"message": {"content": f"Error: {str(e)}"}}]}
+
+    async def emit_message(self, message: str):
+        """Emit a message to the client"""
+        try:
+            await self.__current_event_emitter__(
+                {"type": "message", "data": {"content": message}}
+            )
+        except Exception as e:
+            logger.error(f"Error emitting message: {e}")
+            # Can't do much if this fails, but we don't want to crash
+
+    async def emit_status(self, level: str, message: str, done: bool = False):
+        """Emit a status message to the client"""
+        try:
+            # Check if search is completed
+            state = self.get_state()
+            search_complete = state.get("search_complete", False)
+
+            if search_complete and not done:
+                status = "complete"
+            else:
+                status = "complete" if done else "in_progress"
+
+            await self.__current_event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "status": status,
+                        "level": level,
+                        "description": message,
+                        "done": done,
+                    },
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Error emitting status: {e}")
+            # Can't do much if this fails, but we don't want to crash
+
+    async def generate_search_queries(
+        self,
+        user_message,
+        saved_sources=None,
+        rejected_sources=None,
+        natural_language_feedback=None,
+    ):
+        """Generate search queries based on the user's knowledge and any feedback on previously found sources"""
+        # Get user preferences if available
+        state = self.get_state()
+        user_preferences = state.get("user_preferences", {})
+        pdv = user_preferences.get("pdv")
+        cycle_count = state.get("cycle_count", 0)
+
+        # Create the prompt
+        query_prompt = {
+            "role": "system",
+            "content": """You are a librarian assistant helping to find sources that validate existing knowledge.
+        Based on the user's input and feedback on prior sources, generate 8 search queries.
+        
+        Your queries should:
+        1. Directly target sources that would support or validate the user's stated knowledge
+        2. Be specific and use relevant keywords
+        3. Avoid redundancy with previous searches
+        4. Be concise (5-10 words) but specific
+        5. Target academic, scientific, or reputable sources
+        
+        If the user has indicated preferred or rejected sources:
+        - Generate queries that will find more sources similar to the preferred ones
+        - Avoid terms or approaches that led to rejected sources
+        
+        Format your response as a valid JSON object with the following structure:
+        {"queries": [
+          {"query": "search query 1", "purpose": "brief explanation"}, 
+          {"query": "search query 2", "purpose": "brief explanation"}, 
+          {"query": "search query 3", "purpose": "brief explanation"},
+          {"query": "search query 4", "purpose": "brief explanation"},
+          {"query": "search query 5", "purpose": "brief explanation"},
+          {"query": "search query 6", "purpose": "brief explanation"},
+          {"query": "search query 7", "purpose": "brief explanation"},
+          {"query": "search query 8", "purpose": "brief explanation"}
+        ]}""",
+        }
+
+        # Build context based on available information
+        context = f"User's known information: {user_message}\n\n"
+
+        # Limit sources to just the last 3 cycles if available
+        if saved_sources or rejected_sources:
+            # Get sources with cycle information
+            sources_with_cycle = []
+
+            if saved_sources:
+                for source in saved_sources:
+                    if "cycle" in source:
+                        sources_with_cycle.append(
+                            (source, source.get("cycle", 0), "saved")
+                        )
+                    else:
+                        sources_with_cycle.append((source, cycle_count, "saved"))
+
+            if rejected_sources:
+                for source in rejected_sources:
+                    if "cycle" in source:
+                        sources_with_cycle.append(
+                            (source, source.get("cycle", 0), "rejected")
+                        )
+                    else:
+                        sources_with_cycle.append((source, cycle_count, "rejected"))
+
+            # Sort by cycle (newest first) and limit to last 3 cycles
+            sources_with_cycle.sort(key=lambda x: x[1], reverse=True)
+
+            # Get the cycles to include (up to 3 most recent)
+            cycles_to_include = []
+            for _, cycle, _ in sources_with_cycle:
+                if cycle not in cycles_to_include:
+                    cycles_to_include.append(cycle)
+                    if len(cycles_to_include) >= 3:
+                        break
+
+            # Filter sources to only those from included cycles
+            recent_saved = []
+            recent_rejected = []
+
+            for source, cycle, source_type in sources_with_cycle:
+                if cycle in cycles_to_include:
+                    if source_type == "saved":
+                        recent_saved.append(source)
+                    else:
+                        recent_rejected.append(source)
+        else:
+            recent_saved = saved_sources or []
+            recent_rejected = rejected_sources or []
+
+        # Add saved sources if we have them
+        if recent_saved:
+            context += "## Sources the user found useful:\n"
+            for source in recent_saved:
+                title = source.get("title", "Untitled")
+                url = source.get("url", "No URL")
+                summary = source.get("summary", "No summary")
+                context += f"- {title} ({url})\n  Summary: {summary}\n\n"
+
+        # Add rejected sources if we have them
+        if recent_rejected:
+            context += "## Sources the user did NOT find useful:\n"
+            for source in recent_rejected:
+                title = source.get("title", "Untitled")
+                url = source.get("url", "No URL")
+                summary = source.get("summary", "No summary")
+                context += f"- {title} ({url})\n  Summary: {summary}\n\n"
+
+        # If there's natural language feedback from the user, include it instead of PDV
+        if natural_language_feedback:
+            context += f"\nThis is the user's feedback on the current state of research. Ensure your queries align: '{natural_language_feedback}'\n"
+        # Otherwise include PDV interpretation if available and no natural language feedback
+        elif pdv is not None and not natural_language_feedback:
+            pdv_words = await self.translate_pdv_to_words(pdv)
+            if pdv_words:
+                context += f"\nThese are algorithmically-derived words semantically aligned with the user's preferred direction of research: '{pdv_words}'\n"
+
+        # Add instructions for the query generation
+        context += "\nGenerate 8 search queries that will find sources to validate the user's knowledge based on this information."
+
+        # Generate the queries
+        try:
+            response = await self.generate_completion(
+                self.get_research_model(),
+                [query_prompt, {"role": "user", "content": context}],
+                temperature=self.valves.TEMPERATURE,
+            )
+
+            query_content = response["choices"][0]["message"]["content"]
+
+            # Extract JSON from response
+            try:
+                json_str = query_content[
+                    query_content.find("{") : query_content.rfind("}") + 1
+                ]
+                query_data = json.loads(json_str)
+                query_objects = query_data.get("queries", [])
+
+                # Ensure we have at least 4 queries
+                while len(query_objects) < 4:
+                    query_objects.append(
+                        {
+                            "query": f"{user_message} source {len(query_objects) + 1}",
+                            "purpose": "Find additional sources based on user's knowledge",
+                        }
+                    )
+
+                return query_objects
+
+            except Exception as e:
+                logger.error(f"Error parsing query JSON: {e}")
+                # Fall back to basic queries
+                return [
+                    {
+                        "query": f"{user_message} sources",
+                        "purpose": "Find general sources",
+                    },
+                    {
+                        "query": f"{user_message} research",
+                        "purpose": "Find research papers",
+                    },
+                    {
+                        "query": f"{user_message} evidence",
+                        "purpose": "Find supporting evidence",
+                    },
+                    {
+                        "query": f"{user_message} data",
+                        "purpose": "Find supporting data",
+                    },
+                ]
+
+        except Exception as e:
+            logger.error(f"Error generating search queries: {e}")
+            # Fall back to basic queries
+            return [
+                {"query": f"{user_message} sources", "purpose": "Find general sources"},
+                {
+                    "query": f"{user_message} research",
+                    "purpose": "Find research papers",
+                },
+                {
+                    "query": f"{user_message} evidence",
+                    "purpose": "Find supporting evidence",
+                },
+                {"query": f"{user_message} data", "purpose": "Find supporting data"},
+            ]
+
+    async def process_source_feedback(self, sources, user_message):
+        """Present sources to user and get their feedback for preference learning"""
+
+        # Ask for feedback
+        await self.emit_message(
+            "### Source Feedback\n\n"
+            "Please tell me which sources above are helpful by using commands like:\n\n"
+            "- `/keep 1,3,5` to keep sources 1, 3, and 5\n"
+            "- `/remove 2,4` to remove sources 2 and 4\n"
+            "- Type `done` to finish and see all kept sources\n"
+            "You can also just describe in natural language which sources were helpful and why.\n\n"
+            "I'll use this feedback to find more relevant sources in the next search cycle."
+        )
+
+        # Set up state for waiting for feedback
+        state = self.get_state()
+        self.update_state("waiting_for_source_feedback", True)
+        self.update_state(
+            "source_feedback_data",
+            {
+                "sources": sources,
+                "user_message": user_message,
+            },
+        )
+
+        return {"waiting_for_feedback": True}
+
+    async def process_natural_language_feedback(self, user_message, sources):
+        """Process natural language feedback to determine which sources to keep/remove"""
+        if not sources:
+            return {"kept_sources": [], "removed_sources": []}
+
+        # Create a prompt for the model to interpret user feedback
+        interpret_prompt = {
+            "role": "system",
+            "content": """You are a librarian analyzing user feedback on search results.
+	Based on the user's natural language input, determine which sources should be kept or removed.
+	
+	Categorize each source as EITHER "keep" OR "remove" based on the user's feedback.
+    Don't allow your own biases to affect your analysis - remain purely objective and focused on the user's feedback.
+	
+	Provide your response as a JSON object with two lists: "keep" for indices to keep, and "remove" for indices to remove.
+	Indices should be 0-based (first item is index 0).""",
+        }
+
+        # Prepare context with sources and user message
+        source_list = ""
+        for i, source in enumerate(sources):
+            title = source.get("title", "Untitled")
+            url = source.get("url", "No URL")
+            source_list += f"{i}. {title} ({url})\n"
+
+        context = f"""Available sources:
+	{source_list}
+	
+	User feedback:
+	"{user_message}"
+	
+	Based on this feedback, categorize each source (by index) as either "keep" or "remove".
+	"""
+
+        # Generate interpretation of user feedback
+        try:
+            response = await self.generate_completion(
+                self.get_research_model(),
+                [interpret_prompt, {"role": "user", "content": context}],
+                temperature=self.valves.TEMPERATURE
+                * 0.3,  # Low temperature for consistent interpretation
+            )
+
+            result_content = response["choices"][0]["message"]["content"]
+
+            # Extract JSON from response
+            try:
+                json_str = result_content[
+                    result_content.find("{") : result_content.rfind("}") + 1
+                ]
+                result_data = json.loads(json_str)
+
+                # Get keep and remove lists
+                keep_indices = result_data.get("keep", [])
+                remove_indices = result_data.get("remove", [])
+
+                # Ensure both keep_indices and remove_indices are lists
+                if not isinstance(keep_indices, list):
+                    keep_indices = []
+                if not isinstance(remove_indices, list):
+                    remove_indices = []
+
+                # Ensure each index is in either keep or remove
+                all_indices = set(range(len(sources)))
+                missing_indices = all_indices - set(keep_indices) - set(remove_indices)
+
+                # By default, keep missing indices
+                keep_indices.extend(missing_indices)
+
+                # Convert to kept and removed sources
+                kept_sources = [sources[i] for i in keep_indices if i < len(sources)]
+                removed_sources = [
+                    sources[i] for i in remove_indices if i < len(sources)
+                ]
+
+                logger.info(
+                    f"Natural language feedback interpretation: keep {len(kept_sources)}, remove {len(removed_sources)}"
+                )
+
+                return {
+                    "kept_sources": kept_sources,
+                    "removed_sources": removed_sources,
+                    "kept_indices": keep_indices,
+                    "removed_indices": remove_indices,
+                }
+
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"Error parsing feedback interpretation: {e}")
+                # Default to keeping all sources
+                return {
+                    "kept_sources": sources,
+                    "removed_sources": [],
+                    "kept_indices": list(range(len(sources))),
+                    "removed_indices": [],
+                }
+
+        except Exception as e:
+            logger.error(f"Error interpreting natural language feedback: {e}")
+            # Default to keeping all sources
+            return {
+                "kept_sources": sources,
+                "removed_sources": [],
+                "kept_indices": list(range(len(sources))),
+                "removed_indices": [],
+            }
+
+    async def display_all_kept_sources(self):
+        """Display all kept sources from all cycles, sorted by relevance"""
+        # Get all saved sources
+        state = self.get_state()
+        saved_sources = state.get("saved_sources", [])
+
+        if not saved_sources:
+            await self.emit_message(
+                "\n### No Saved Sources\n\nNo sources have been saved during the search process.\n"
+            )
+            return
+
+        # Get original message for relevance calculation
+        original_message = ""
+        feedback_data = state.get("source_feedback_data", {})
+        if feedback_data:
+            original_message = feedback_data.get("user_message", "")
+
+        # Get user preferences
+        user_preferences = state.get("user_preferences", {})
+        pdv = user_preferences.get("pdv")
+        pdv_impact = user_preferences.get("impact", 0.0)
+
+        # Calculate relevance scores for sorting
+        sources_with_scores = []
+
+        # Get embedding for original query if available
+        query_embedding = None
+        if original_message:
+            query_embedding = await self.get_embedding(original_message)
+
+        for source in saved_sources:
+            # Default score in case we can't calculate
+            score = 0.5
+
+            # Try to use existing similarity score
+            if "similarity" in source:
+                score = source["similarity"]
+            else:
+                # Calculate similarity if we have query embedding
+                if query_embedding and "content" in source:
+                    # Use summary or first part of content for comparison
+                    content_for_comparison = source.get("summary", "")
+                    if not content_for_comparison:
+                        content_for_comparison = source.get("content", "")[:2000]
+
+                    if content_for_comparison:
+                        content_embedding = await self.get_embedding(
+                            content_for_comparison
+                        )
+                        if content_embedding:
+                            # Calculate basic similarity
+                            similarity = cosine_similarity(
+                                [content_embedding], [query_embedding]
+                            )[0][0]
+
+                            # Apply PDV influence if available
+                            if pdv is not None and pdv_impact > 0.1:
+                                # Calculate alignment with PDV
+                                pdv_array = np.array(pdv)
+                                content_array = np.array(content_embedding)
+                                alignment = np.dot(content_array, pdv_array)
+                                # Normalize to 0-1 range
+                                alignment = (alignment + 1) / 2  # -1,1 -> 0,1
+
+                                # Scale by impact and strength
+                                pdv_factor = (
+                                    alignment
+                                    * pdv_impact
+                                    * self.valves.PREFERENCE_STRENGTH
+                                )
+
+                                # Apply PDV influence
+                                similarity += pdv_factor
+
+                            score = similarity
+
+            # Add to sources with scores
+            sources_with_scores.append((source, score))
+
+        # Sort by score (highest first)
+        sources_with_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # Display sorted sources
+        await self.emit_message(
+            "\n### All Saved Sources\n\nHere are all the sources you've kept, sorted by relevance:\n\n"
+        )
+
+        # Renumber sources sequentially after sorting
+        for i, (source, score) in enumerate(sources_with_scores):
+            # Use new sequential number (1-based)
+            source_number = i + 1
+            query = source.get("query", "Unknown query")
+
+            source_display = f"**Source {source_number} for '{query}'**\n"
+            source_display += f"URL: {source.get('url', 'No URL')}\n"
+            source_display += (
+                f"Summary: {source.get('summary', 'No summary available')}\n"
+            )
+            source_display += f"Relevance Score: {score:.2f}\n\n"
+            source_display += "---\n\n"
+
+            await self.emit_message(source_display)
+
+        # Completed the search
+        self.update_state("search_complete", True)
+        await self.emit_status(
+            "success", "Search complete - displayed all saved sources", True
+        )
+
+    async def process_source_feedback_continuation(self, user_message):
+        """Process the user feedback received in a continuation call"""
+        # Get the data from the previous call
+        state = self.get_state()
+        feedback_data = state.get("source_feedback_data", {})
+        sources = feedback_data.get("sources", [])
+        original_message = feedback_data.get("user_message", "")
+        cycle_count = state.get("cycle_count", 0)
+
+        # Process the user input
+        user_input = user_message.strip()
+
+        # Check if user wants to end the search and see all kept sources
+        if user_input.lower() == "done":
+            # Save ALL current sources
+            saved_sources = state.get("saved_sources", [])
+
+            # Add all current sources to saved_sources, avoiding duplicates by URL
+            saved_urls = set(source.get("url", "") for source in saved_sources)
+            for source in sources:
+                if source.get("url", "") not in saved_urls:
+                    # Add cycle information to the source
+                    source["cycle"] = cycle_count
+                    saved_sources.append(source)
+                    saved_urls.add(source.get("url", ""))
+
+            # Update state
+            self.update_state("saved_sources", saved_sources)
+
+            await self.emit_message(
+                "\n*Ending search and displaying all kept sources.*\n\n"
+            )
+            await self.display_all_kept_sources()
+            return {
+                "kept_sources": [],
+                "removed_sources": [],
+                "kept_indices": [],
+                "removed_indices": [],
+                "preference_vector": {"pdv": None, "strength": 0.0, "impact": 0.0},
+                "search_complete": True,
+            }
+
+        # If user just wants to continue with all sources
+        if user_input.lower() == "continue" or not user_input:
+            await self.emit_message("\n*Continuing with all sources.*\n\n")
+            return {
+                "kept_sources": sources,
+                "removed_sources": [],
+                "kept_indices": list(range(len(sources))),
+                "removed_indices": [],
+                "preference_vector": {"pdv": None, "strength": 0.0, "impact": 0.0},
+            }
+
+        # Extract natural language feedback if combined with slash command
+        natural_language_feedback = None
+        slash_part = user_input
+
+        # Check for slash commands at the beginning
+        slash_keep_patterns = [r"^/k\s", r"^/keep\s"]
+        slash_remove_patterns = [r"^/r\s", r"^/remove\s"]
+
+        is_keep_cmd = any(
+            re.match(pattern, user_input) for pattern in slash_keep_patterns
+        )
+        is_remove_cmd = any(
+            re.match(pattern, user_input) for pattern in slash_remove_patterns
+        )
+
+        # Only process period as separator if we start with a slash command
+        if is_keep_cmd or is_remove_cmd:
+            # Look for the first period after the command part
+            command_end_idx = user_input.find(" ")
+            if command_end_idx > -1:
+                # Find the first period after the command and its arguments
+                period_idx = user_input.find(".", command_end_idx)
+                if period_idx > -1:
+                    slash_part = user_input[:period_idx].strip()
+                    natural_language_feedback = user_input[period_idx + 1 :].strip()
+
+                    # Provide feedback to the user about the natural language portion
+                    if natural_language_feedback:
+                        await self.emit_message(
+                            f'\n*Noted your feedback: "{natural_language_feedback}"*\n'
+                        )
+        else:
+            # If no slash command is detected, the entire input is natural language
+            natural_language_feedback = user_input
+            # No slash command to process
+            is_keep_cmd = is_remove_cmd = False
+
+        # Process slash commands
+        if is_keep_cmd or is_remove_cmd:
+            # Extract the item indices/ranges part
+            if is_keep_cmd:
+                items_part = re.sub(r"^(/k|/keep)\s+", "", slash_part).replace(",", " ")
+            else:
+                items_part = re.sub(r"^(/r|/remove)\s+", "", slash_part).replace(
+                    ",", " "
+                )
+
+            # Process the indices and ranges
+            selected_indices = set()
+            for part in items_part.split():
+                part = part.strip()
+                if not part:
+                    continue
+
+                # Check if it's a range (e.g., 5-9)
+                if "-" in part:
+                    try:
+                        start, end = map(int, part.split("-"))
+                        # Validate range bounds before converting to 0-indexed
+                        if (
+                            start < 1
+                            or start > len(sources)
+                            or end < 1
+                            or end > len(sources)
+                        ):
+                            await self.emit_message(
+                                f"Invalid range '{part}': valid range is 1-{len(sources)}. Skipping."
+                            )
+                            continue
+
+                        # Convert to 0-indexed
+                        start = start - 1
+                        end = end - 1
+                        selected_indices.update(range(start, end + 1))
+                    except ValueError:
+                        await self.emit_message(
+                            f"Invalid range format: '{part}'. Skipping."
+                        )
+                else:
+                    # Single number
+                    try:
+                        idx = int(part)
+                        # Validate index before converting to 0-indexed
+                        if idx < 1 or idx > len(sources):
+                            await self.emit_message(
+                                f"Index {idx} out of range: valid range is 1-{len(sources)}. Skipping."
+                            )
+                            continue
+
+                        # Convert to 0-indexed
+                        idx = idx - 1
+                        selected_indices.add(idx)
+                    except ValueError:
+                        await self.emit_message(f"Invalid number: '{part}'. Skipping.")
+
+            # Convert to lists
+            selected_indices = sorted(list(selected_indices))
+
+            # Determine kept and removed indices based on mode
+            if is_keep_cmd:
+                # Keep mode - selected indices are kept, others removed
+                kept_indices = selected_indices
+                removed_indices = [
+                    i for i in range(len(sources)) if i not in kept_indices
+                ]
+            else:
+                # Remove mode - selected indices are removed, others kept
+                removed_indices = selected_indices
+                kept_indices = [
+                    i for i in range(len(sources)) if i not in removed_indices
+                ]
+
+            # Get the actual sources
+            kept_sources = [sources[i] for i in kept_indices if i < len(sources)]
+            removed_sources = [sources[i] for i in removed_indices if i < len(sources)]
+        else:
+            # Process natural language feedback
+            nl_feedback = await self.process_natural_language_feedback(
+                natural_language_feedback, sources
+            )
+
+            # Make sure we have a valid response, not None
+            if nl_feedback is None:
+                # Default to keeping all sources
+                nl_feedback = {
+                    "kept_sources": sources,
+                    "removed_sources": [],
+                    "kept_indices": list(range(len(sources))),
+                    "removed_indices": [],
+                }
+
+            kept_sources = nl_feedback.get("kept_sources", sources)
+            removed_sources = nl_feedback.get("removed_sources", [])
+            kept_indices = nl_feedback.get("kept_indices", list(range(len(sources))))
+            removed_indices = nl_feedback.get("removed_indices", [])
+
+        # Create items for PDV calculation
+        kept_items = []
+        removed_items = []
+
+        # Extract content from kept sources
+        for source in kept_sources:
+            content = source.get("content", "")[
+                :2000
+            ]  # Use first 2000 chars for embedding
+            summary = source.get("summary", "")
+            title = source.get("title", "")
+
+            # Use summary if available, or first few sentences of content
+            if summary:
+                kept_items.append(summary)
+            elif content:
+                # Extract first few sentences
+                sentences = re.split(r"(?<=[.!?])\s+", content, maxsplit=3)
+                if sentences:
+                    kept_items.append(" ".join(sentences[:3]))
+
+            # Add title as a separate item
+            if title:
+                kept_items.append(title)
+
+        # Extract content from removed sources
+        for source in removed_sources:
+            content = source.get("content", "")[
+                :2000
+            ]  # Use first 2000 chars for embedding
+            summary = source.get("summary", "")
+            title = source.get("title", "")
+
+            # Use summary if available, or first few sentences of content
+            if summary:
+                removed_items.append(summary)
+            elif content:
+                # Extract first few sentences
+                sentences = re.split(r"(?<=[.!?])\s+", content, maxsplit=3)
+                if sentences:
+                    removed_items.append(" ".join(sentences[:3]))
+
+            # Add title as a separate item
+            if title:
+                removed_items.append(title)
+
+        # Calculate preference direction vector based on kept and removed sources
+        preference_vector = await self.calculate_preference_direction_vector(
+            kept_items, removed_items
+        )
+
+        # Update user_preferences in state with the new preference vector
+        self.update_state("user_preferences", preference_vector)
+        logger.info(
+            f"Updated user_preferences with PDV impact: {preference_vector.get('impact', 0.0):.3f}"
+        )
+
+        # Show the user what's happening
+        await self.emit_message("\n### Feedback Processed\n")
+
+        if kept_sources:
+            # Display kept sources with their simple sequential number
+            kept_list = "\n".join(
+                [
+                    f"✓ Source {source.get('source_number')}: {source.get('title', 'Untitled')}"
+                    for source in kept_sources
+                ]
+            )
+            await self.emit_message(
+                f"**Keeping {len(kept_sources)} sources:**\n{kept_list}\n"
+            )
+
+        if removed_sources:
+            # Display removed sources with their simple sequential number
+            removed_list = "\n".join(
+                [
+                    f"✗ Source {source.get('source_number')}: {source.get('title', 'Untitled')}"
+                    for source in removed_sources
+                ]
+            )
+            await self.emit_message(
+                f"**Removing {len(removed_sources)} sources:**\n{removed_list}\n"
+            )
+
+        # Update saved and rejected sources lists
+        state = self.get_state()
+        saved_sources = state.get("saved_sources", [])
+        rejected_sources = state.get("rejected_sources", [])
+
+        # Add new sources to the lists, avoiding duplicates by URL
+        saved_urls = set(source.get("url", "") for source in saved_sources)
+        for source in kept_sources:
+            if source.get("url", "") not in saved_urls:
+                # Add cycle information to the source
+                source["cycle"] = cycle_count
+                saved_sources.append(source)
+                saved_urls.add(source.get("url", ""))
+
+        rejected_urls = set(source.get("url", "") for source in rejected_sources)
+        for source in removed_sources:
+            if source.get("url", "") not in rejected_urls:
+                # Add cycle information to the source
+                source["cycle"] = cycle_count
+                rejected_sources.append(source)
+                rejected_urls.add(source.get("url", ""))
+
+        # Update state
+        self.update_state("saved_sources", saved_sources)
+        self.update_state("rejected_sources", rejected_sources)
+
+        await self.emit_message(
+            "Generating new search queries based on your feedback...\n"
+        )
+
+        return {
+            "kept_sources": kept_sources,
+            "removed_sources": removed_sources,
+            "kept_indices": kept_indices,
+            "removed_indices": removed_indices,
+            "preference_vector": preference_vector,
+            "natural_language_feedback": natural_language_feedback,
+        }
+
+    async def pipe(
+        self,
+        body: dict,
+        __user__: dict,
+        __event_emitter__=None,
+        __event_call__=None,
+        __task__=None,
+        __model__=None,
+        __request__=None,
+    ) -> str:
+        self.__current_event_emitter__ = __event_emitter__
+        self.__current_event_call__ = __event_call__
+        self.__user__ = User(**__user__)
+        self.__model__ = __model__
+        self.__request__ = __request__
+
+        # Extract conversation ID from the message history
+        messages = body.get("messages", [])
+        if not messages:
+            return ""
+
+        # First message ID in the conversation serves as our conversation identifier
+        first_message = messages[0] if messages else {}
+        conversation_id = f"{__user__['id']}_{first_message.get('id', 'default')}"
+        self.conversation_id = conversation_id
+
+        # Check if this appears to be a completely new conversation
+        state = self.get_state()
+        waiting_for_source_feedback = state.get("waiting_for_source_feedback", False)
+        if (
+            len(messages) <= 2 and not waiting_for_source_feedback
+        ):  # Only reset if not waiting for feedback
+            logger.info(f"New conversation detected with ID: {conversation_id}")
+            self.reset_state()  # Reset all state for this conversation
+
+        # Initialize source table if not exists
+        state = self.get_state()
+        if "source_table" not in state:
+            self.update_state("source_table", {})
+
+        # Initialize other critical state variables if missing
+        if "url_selected_count" not in state:
+            self.update_state("url_selected_count", {})
+
+        if "url_token_counts" not in state:
+            self.update_state("url_token_counts", {})
+
+        if "saved_sources" not in state:
+            self.update_state("saved_sources", [])
+
+        if "rejected_sources" not in state:
+            self.update_state("rejected_sources", [])
+
+        if "sources_list" not in state:
+            self.update_state("sources_list", [])
+
+        if "cycle_count" not in state:
+            self.update_state("cycle_count", 0)
+
+        # If the pipe is disabled or it's not a default task, return
+        if not self.valves.ENABLED or (__task__ and __task__ != TASKS.DEFAULT):
+            return ""
+
+        # Get user query from the latest message
+        user_message = messages[-1].get("content", "").strip()
+        if not user_message:
+            return ""
+
+        # Set search date
+        from datetime import datetime
+
+        self.search_date = datetime.now().strftime("%Y-%m-%d")
+
+        # Preload vocabulary embeddings if enabled
+        if self.valves.PRELOAD_VOCABULARY and not self.vocabulary_embeddings:
+            try:
+                await self.load_vocabulary_embeddings()
+            except Exception as e:
+                logger.error(f"Error preloading vocabulary: {e}")
+
+        # Get state for this conversation
+        state = self.get_state()
+
+        # Check if waiting for source feedback
+        if state.get("waiting_for_source_feedback", False):
+            # We're expecting source feedback - process it
+            self.update_state("waiting_for_source_feedback", False)
+            feedback_result = await self.process_source_feedback_continuation(
+                user_message
+            )
+
+            # Check if search is complete (user typed 'done')
+            if feedback_result.get("search_complete", False):
+                return ""
+
+            # Increment cycle count
+            cycle_count = state.get("cycle_count", 0) + 1
+            self.update_state("cycle_count", cycle_count)
+
+            # Get saved and rejected sources for query generation
+            saved_sources = state.get("saved_sources", [])
+            rejected_sources = state.get("rejected_sources", [])
+
+            # Get the original query
+            original_message = state.get("source_feedback_data", {}).get(
+                "user_message", ""
+            )
+
+            # Check if we have natural language feedback from the user
+            natural_language_feedback = feedback_result.get("natural_language_feedback")
+
+            # Generate new queries based on feedback
+            await self.emit_status(
+                "info", "Generating new search queries based on your feedback...", False
+            )
+            query_objects = await self.generate_search_queries(
+                original_message,
+                saved_sources,
+                rejected_sources,
+                natural_language_feedback,
+            )
+
+            # Display new queries
+            await self.emit_message(f"### Cycle {cycle_count}: New Search Queries\n\n")
+            for query_obj in query_objects:
+                query = query_obj.get("query", "")
+                purpose = query_obj.get("purpose", "")
+                await self.emit_message(
+                    f"**Query**: {query}\n**Purpose**: {purpose}\n\n"
+                )
+
+            # Add queries to search history
+            search_history = state.get("search_history", [])
+            for query_obj in query_objects:
+                search_history.append(query_obj.get("query", ""))
+            self.update_state("search_history", search_history)
+
+            # Process the queries and get sources
+            all_sources = []
+
+            # Start counter at 1 for each new cycle
+            source_counter = 1
+
+            for query_obj in query_objects:
+                query = query_obj.get("query", "")
+
+                # Get query embedding
+                query_embedding = await self.get_embedding(query)
+                if not query_embedding:
+                    query_embedding = [0] * 384  # Default embedding size
+
+                # Process query and get sources - pass the current counter
+                sources = await self.process_query(
+                    query, query_embedding, source_counter
+                )
+
+                # Update counter for next query
+                source_counter += len(sources)
+
+                all_sources.extend(sources)
+
+            # Deduplicate sources by URL
+            unique_sources = {}
+            for source in all_sources:
+                url = source.get("url", "")
+                if url and url not in unique_sources:
+                    unique_sources[url] = source
+
+            # Convert back to list
+            unique_source_list = list(unique_sources.values())
+
+            # Store sources for next cycle
+            self.update_state("sources_list", unique_source_list)
+
+            # Present sources for feedback
+            if unique_source_list:
+                await self.process_source_feedback(unique_source_list, original_message)
+            else:
+                await self.emit_message(
+                    "\n*No new sources found. Would you like to refine your search terms?*\n\n"
+                )
+                self.update_state("search_complete", True)
+
+            return ""
+
+        # Initial query processing
+        await self.emit_status("info", "Starting source finder...", False)
+        await self.emit_message("## Source Finder Mode: Activated\n\n")
+        await self.emit_message(
+            "I'll search for sources that validate your knowledge. This might take a moment...\n\n"
+        )
+
+        # Generate initial search queries
+        await self.emit_status("info", "Generating initial search queries...", False)
+        query_objects = await self.generate_search_queries(user_message)
+
+        # Display the queries to the user
+        await self.emit_message(f"### Initial Search Queries\n\n")
+        for query_obj in query_objects:
+            query = query_obj.get("query", "")
+            purpose = query_obj.get("purpose", "")
+            await self.emit_message(f"**Query**: {query}\n**Purpose**: {purpose}\n\n")
+
+        # Add queries to search history
+        search_history = state.get("search_history", [])
+        for query_obj in query_objects:
+            search_history.append(query_obj.get("query", ""))
+        self.update_state("search_history", search_history)
+
+        # Process each query and collect sources
+        all_sources = []
+
+        # Start counter at 1 for first cycle
+        source_counter = 1
+
+        for query_obj in query_objects:
+            query = query_obj.get("query", "")
+
+            # Get query embedding
+            query_embedding = await self.get_embedding(query)
+            if not query_embedding:
+                query_embedding = [0] * 384  # Default embedding size
+
+            # Process query and get sources - pass the current counter
+            sources = await self.process_query(query, query_embedding, source_counter)
+
+            # Update counter for next query
+            source_counter += len(sources)
+
+            all_sources.extend(sources)
+
+        # Deduplicate sources by URL
+        unique_sources = {}
+        for source in all_sources:
+            url = source.get("url", "")
+            if url and url not in unique_sources:
+                unique_sources[url] = source
+
+        # Convert back to list
+        unique_source_list = list(unique_sources.values())
+
+        # Store sources for next cycle
+        self.update_state("sources_list", unique_source_list)
+
+        # Set initial cycle count
+        self.update_state("cycle_count", 1)
+
+        # Present sources for feedback
+        if unique_source_list:
+            await self.process_source_feedback(unique_source_list, user_message)
+        else:
+            await self.emit_message(
+                "\n*No sources found. Would you like to try different search terms?*\n\n"
+            )
+            self.update_state("search_complete", True)
+
+        return ""
