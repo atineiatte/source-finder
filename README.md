@@ -1,4 +1,6 @@
-Source Finder is a fork of my Deep Research at Home script. Instead of completing the whole report process for you, it just finds relevant sources and summarizes them for your reference - basically interactive SearXNG, which you will need for this to work. Below is an example source finding instance:
+Source Finder is a fork of my Deep Research at Home script. Instead of completing the whole report process for you, it just finds relevant sources and summarizes them for your reference - basically interactive SearXNG, which you will need for this to work. 
+
+This is an Open WebUI function that uses Ollama and SearXNG for backend stuff. Paste the pipe code into a new Open WebUI function, specifying your SearXNG instance in SEARCH_URL, make sure you have external libraries installed (BeautifulSoup, PyPDF2, pdfplumber, fake_useragent, scikit-learn, numpy, a couple others?) and it'll be ready to use in an Open WebUI chat. Below is an example source finding instance:
 
 ---
 
