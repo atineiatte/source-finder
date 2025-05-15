@@ -4085,7 +4085,7 @@ class Pipe:
         await self.emit_status("info", "Starting source finder...", False)
         await self.emit_message("## Source Finder Mode: Activated\n\n")
         await self.emit_message(
-            "I'll search for sources that validate your knowledge. This might take a moment...\n\n"
+            "I'll search for sources to address your query. This might take a moment...\n\n"
         )
 
         # Generate initial search queries
